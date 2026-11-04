@@ -1,0 +1,378 @@
+#!/bin/bash
+# jw - JobWatcher command line (Slurm edition).
+#
+#   jw setup  [options]      create a simulation in the current directory
+#   jw start  [-n DEPTH]     create Run1, submit it, and queue DEPTH successors
+#   jw status                show every run, its Slurm state and progress
+#   jw stop   [--kill]       create STOP, cancel queued successors (--kill: also the running job)
+#   jw resume [-n DEPTH]     remove STOP, move failed runs aside, submit the next run
+#   jw sync                  copy the current library and batch template into .sim_data
+#   jw log                   show chain.log
+#   jw config                show the effective configuration
+#   jw help
+#
+# Config precedence: clusters/<JW_CLUSTER>.conf < ~/.JobWatcher/config (or $JW_CONFIG) < jw setup options.
+
+set -uo pipefail
+
+JW_BIN=$(readlink -f "${BASH_SOURCE[0]}")
+JW_HOME=$(cd "$(dirname "$JW_BIN")/.." && pwd -P)
+. "$JW_HOME/lib/jw_common.sh"
+
+jw_load_install_config() {
+  local cluster=${JW_CLUSTER:-gp} f
+  f="$JW_HOME/clusters/$cluster.conf"
+  [ -r "$f" ] && . "$f"
+  f=${JW_CONFIG:-$HOME/.JobWatcher/config}
+  [ -r "$f" ] && . "$f"
+  jw_apply_defaults
+}
+
+need_sim() {
+  SIMDIR=$(jw_find_simdir "${1:-.}") || jw_die "no simulation here (no .sim_data/config found in $(pwd -P) or its parents)"
+  jw_load_sim "$SIMDIR"
+}
+
+ask() {                     # <prompt> <default> -> value (prompts unless ASSUME_YES)
+  local val
+  if [ "$ASSUME_YES" = yes ]; then echo "$2"; return; fi
+  read -r -p "$1 [$2]: " val
+  echo "${val:-$2}"
+}
+ask_required() {            # <prompt> -> value (keeps asking)
+  local val=""
+  while [ -z "$val" ]; do
+    [ "$ASSUME_YES" = yes ] && jw_die "$1 is required (pass it as an option when using --yes)"
+    read -r -p "$1: " val
+  done
+  echo "$val"
+}
+
+# ---------------------------------------------------------------- parfile adaptation
+# Make the template drive checkpointing from JobWatcher: checkpoint/recover dir, max_runtime, terminate mode.
+adapt_parfile() {           # <template-file>
+  local f=$1 v notes=()
+  set_par() {               # <param-regex> <display-name> <value>  (replace last assignment or append)
+    local re=$1 name=$2 val=$3
+    if grep -qiE "^[[:space:]]*$re[[:space:]]*=" "$f"; then
+      local n; n=$(grep -niE "^[[:space:]]*$re[[:space:]]*=" "$f" | tail -n1 | cut -d: -f1)
+      sed -i "${n}s|^.*\$|$name = $val|" "$f"
+    else
+      printf '\n%s = %s\n' "$name" "$val" >> "$f"
+    fi
+  }
+  grep -q '@REP{CHECKPOINT_DIR}' "$f" || {
+    set_par 'IO::checkpoint_dir' 'IO::checkpoint_dir' '"@REP{CHECKPOINT_DIR}"'
+    set_par 'IO::recover_dir'    'IO::recover_dir'    '"@REP{CHECKPOINT_DIR}"'
+    notes+=("IO::checkpoint_dir and IO::recover_dir now point at @REP{CHECKPOINT_DIR}")
+  }
+  grep -q '@REP{MAX_RUNTIME}' "$f" || {
+    set_par 'cactus::max_runtime' 'cactus::max_runtime' '@REP{MAX_RUNTIME}'
+    notes+=("cactus::max_runtime = @REP{MAX_RUNTIME} (minutes, derived from WALLTIME - RUNTIME_MARGIN_MIN)")
+  }
+  # Keep an existing final condition (iteration/time) and add the runtime limit: "any".
+  # A degenerate condition (cctk_itlast <= 0, cctk_final_time <= 0) is dropped: "runtime".
+  v=$(jw_par_get "$f" 'cactus::terminate' | tr 'A-Z' 'a-z'); [ -n "$v" ] || v=iteration   # Cactus default
+  local itlast ftime; itlast=$(jw_num "$(jw_par_get "$f" 'cactus::cctk_itlast')"); ftime=$(jw_num "$(jw_par_get "$f" 'cactus::cctk_final_time')")
+  local it_ok=no t_ok=no
+  [ -n "$itlast" ] && awk "BEGIN{exit !($itlast > 0)}" && it_ok=yes
+  [ -n "$ftime" ]  && awk "BEGIN{exit !($ftime > 0)}"  && t_ok=yes
+  # "any" stops when iteration >= cctk_itlast OR time >= cctk_final_time OR runtime >= max_runtime,
+  # and the Cactus defaults (cctk_itlast=10, cctk_final_time=-1) would stop a run at once, so every
+  # condition that is not wanted gets a sentinel that can never be reached.
+  use_any() {
+    set_par 'cactus::terminate' 'cactus::terminate' '"any"'
+    [ $it_ok = yes ] || { set_par 'cactus::cctk_itlast' 'cactus::cctk_itlast' '1000000000'; notes+=("cactus::cctk_itlast set to 1000000000 (sentinel: no iteration limit; was ${itlast:-unset})"); }
+    [ $t_ok = yes ]  || { set_par 'cactus::cctk_final_time' 'cactus::cctk_final_time' '1e30'; notes+=("cactus::cctk_final_time set to 1e30 (sentinel: no time limit; was ${ftime:-unset})"); }
+  }
+  case $v in
+    runtime) ;;
+    any|all) if [ $it_ok = yes ] || [ $t_ok = yes ]; then use_any; notes+=("cactus::terminate \"$v\" -> \"any\" with sentinels for unused conditions")
+             else set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\": was \"$v\" but neither cctk_itlast (${itlast:-unset}) nor cctk_final_time (${ftime:-unset}) is positive"); fi ;;
+    iteration) if [ $it_ok = yes ]; then use_any; notes+=("cactus::terminate \"iteration\" -> \"any\": runs stop at cctk_itlast=$itlast or on max_runtime")
+               else set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\" (was \"iteration\" with cctk_itlast=${itlast:-unset}); the chain ends only via 'jw stop' or MAX_RUNS"); fi ;;
+    time)      if [ $t_ok = yes ]; then use_any; notes+=("cactus::terminate \"time\" -> \"any\": runs stop at cctk_final_time=$ftime or on max_runtime")
+               else set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\" (was \"time\" with cctk_final_time=${ftime:-unset})"); fi ;;
+    *)         set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\" (was \"$v\")") ;;
+  esac
+  v=$(jw_par_get "$f" 'IO::recover' | tr 'A-Z' 'a-z')
+  [ "$v" = autoprobe ] || { set_par 'IO::recover' 'IO::recover' '"autoprobe"'; notes+=("IO::recover set to \"autoprobe\" (was \"${v:-unset}\")"); }
+  v=$(jw_par_get "$f" 'IO::checkpoint_on_terminate' | tr 'A-Z' 'a-z')
+  [ "$v" = yes ] || { set_par 'IO::checkpoint_on_terminate' 'IO::checkpoint_on_terminate' 'yes'; notes+=("IO::checkpoint_on_terminate set to yes (was \"${v:-unset}\")"); }
+  v=$(jw_par_get "$f" 'CarpetIOHDF5::checkpoint' | tr 'A-Z' 'a-z')
+  [ "$v" = yes ] || { set_par 'CarpetIOHDF5::checkpoint' 'CarpetIOHDF5::checkpoint' '"yes"'; notes+=("CarpetIOHDF5::checkpoint set to \"yes\" (was \"${v:-unset}\")"); }
+  if [ ${#notes[@]} -gt 0 ]; then
+    echo "parfile template adjusted:"; printf '  - %s\n' "${notes[@]}"
+  fi
+  v=$(jw_par_get "$f" 'IO::checkpoint_every')
+  [ -n "$v" ] || jw_warn "IO::checkpoint_every is not set: only termination checkpoints will exist (fine, but a crash loses the whole run)"
+}
+
+# ---------------------------------------------------------------- setup
+cmd_setup() {
+  jw_load_install_config
+  ASSUME_YES=no
+  local NAME="" PARTPL="" EXEPATH=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --name|-N) NAME=$2; shift 2 ;;
+      --parfile|-p) PARTPL=$2; shift 2 ;;
+      --exe|-e) EXEPATH=$2; shift 2 ;;
+      --partition|-q) PARTITION=$2; shift 2 ;;
+      --time|-t) WALLTIME=$2; shift 2 ;;
+      --nodes) NODES=$2; shift 2 ;;
+      --tasks-per-node) TASKS_PER_NODE=$2; shift 2 ;;
+      --cpus-per-task) CPUS_PER_TASK=$2; shift 2 ;;
+      --mem) MEM=$2; shift 2 ;;
+      --max-runs) MAX_RUNS=$2; shift 2 ;;
+      --queue-depth) QUEUE_DEPTH=$2; shift 2 ;;
+      --min-progress) MIN_PROGRESS=$2; shift 2 ;;
+      --margin) RUNTIME_MARGIN_MIN=$2; shift 2 ;;
+      --hook) POST_RUN_HOOK=$2; shift 2 ;;
+      --mail) MAIL=$2; shift 2 ;;
+      --mail-events) MAIL_EVENTS=$2; shift 2 ;;
+      --setup-script) SETUP_SCRIPT=$2; shift 2 ;;
+      --launcher) LAUNCHER=$2; shift 2 ;;
+      --strict-checkpoint) STRICT_CHECKPOINT=yes; shift ;;
+      --yes|-y) ASSUME_YES=yes; shift ;;
+      -h|--help) usage_setup; exit 0 ;;
+      *) jw_die "setup: unknown option $1 (try jw setup --help)" ;;
+    esac
+  done
+  SIMDIR=$(pwd -P)
+  [ -e "$SIMDIR/.sim_data" ] && jw_die "$SIMDIR already contains .sim_data; use a fresh directory"
+
+  [ -n "$NAME" ]    || NAME=$(ask_required "Simulation nickname (used in job names)")
+  [[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || jw_die "nickname must be [A-Za-z0-9._-]"
+  [ -n "$PARTPL" ]  || PARTPL=$(ask_required "Parameter file (template; @REP{...} placeholders optional)")
+  [ -r "$PARTPL" ]  || jw_die "cannot read parameter file $PARTPL"
+  [ -n "$EXEPATH" ] || EXEPATH=$(ask_required "Cactus executable")
+  [ -x "$EXEPATH" ] || jw_die "$EXEPATH is not executable"
+  PARTITION=$(ask "Partition" "$PARTITION")
+  WALLTIME=$(ask "Walltime per run ([D-]HH:MM:SS)" "$WALLTIME")
+  NODES=$(ask "Nodes" "$NODES")
+  TASKS_PER_NODE=$(ask "MPI tasks per node" "$TASKS_PER_NODE")
+  CPUS_PER_TASK=$(ask "OpenMP threads per task" "$CPUS_PER_TASK")
+  MEM=$(ask "Memory per node (--mem, e.g. 16G; empty = Slurm default)" "$MEM")
+  MAX_RUNS=$(ask "Maximum number of runs" "$MAX_RUNS")
+  QUEUE_DEPTH=$(ask "Successors to keep queued" "$QUEUE_DEPTH")
+  RUNTIME_MARGIN_MIN=$(ask "Minutes reserved at the end of each run for the termination checkpoint" "$RUNTIME_MARGIN_MIN")
+  MAIL=$(ask "Mail address" "$MAIL")
+
+  local mins; mins=$(jw_walltime_minutes "$WALLTIME")
+  (( mins > RUNTIME_MARGIN_MIN )) || jw_die "walltime $WALLTIME is not longer than the margin of $RUNTIME_MARGIN_MIN minutes"
+  (( TASKS_PER_NODE * CPUS_PER_TASK == CORES_PER_NODE )) || jw_warn "TASKS_PER_NODE*CPUS_PER_TASK = $(( TASKS_PER_NODE * CPUS_PER_TASK )) does not equal CORES_PER_NODE=$CORES_PER_NODE"
+
+  EXE=$(basename "$EXEPATH")
+  PARFILE=$(basename "$PARTPL"); PARFILE=${PARFILE%.template}; PARFILE=${PARFILE%.par}.par
+  local outdir; outdir=$(jw_par_get "$PARTPL" 'IO::out_dir')
+  case $outdir in
+    ''|'$parfile') DATADIRNAME=${PARFILE%.par} ;;
+    *) DATADIRNAME=$outdir ;;
+  esac
+  CHECKPOINT_DIR=$SIMDIR/CheckPoint
+
+  local sd=$SIMDIR/.sim_data
+  mkdir -p "$sd" "$CHECKPOINT_DIR" || jw_die "cannot create directories"
+  cp "$EXEPATH" "$sd/$EXE" || jw_die "cannot copy executable"
+  cp "$PARTPL" "$sd/parfile.template" || jw_die "cannot copy parameter file"
+  adapt_parfile "$sd/parfile.template"
+  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$JW_HOME/templates/sub.template" "$sd/"
+  echo 0 > "$sd/last"
+  write_config "$sd/config" "$NAME"
+  jw_log setup - CREATED "name=$NAME exe=$EXE parfile=$PARFILE nodes=$NODES walltime=$WALLTIME partition=$PARTITION"
+  echo
+  echo "Simulation '$NAME' set up in $SIMDIR"
+  echo "  config   : $sd/config   (edit between runs; successors pick up changes)"
+  echo "  parfile  : $sd/parfile.template"
+  echo "  next     : jw start"
+}
+
+write_config() {            # <file> <name>
+  cat > "$1" <<EOT
+# JobWatcher simulation configuration (generated $(date '+%Y-%m-%d %H:%M') by jw $JW_VERSION).
+# Edit freely between runs: every successor is prepared from the current values.
+SIMNAME=$2
+EXE=$EXE
+PARFILE=$PARFILE
+DATADIRNAME=$DATADIRNAME
+CHECKPOINT_DIR=$CHECKPOINT_DIR
+
+PARTITION=$PARTITION
+WALLTIME=$WALLTIME
+NODES=$NODES
+CORES_PER_NODE=$CORES_PER_NODE
+TASKS_PER_NODE=$TASKS_PER_NODE
+CPUS_PER_TASK=$CPUS_PER_TASK
+MEM=$MEM
+SBATCH_EXTRA=$(printf %q "$SBATCH_EXTRA")
+
+SETUP_SCRIPT=$(printf %q "$SETUP_SCRIPT")
+LAUNCHER=$(printf %q "$LAUNCHER")
+OMP_PROC_BIND=$OMP_PROC_BIND
+OMP_PLACES=$OMP_PLACES
+EXTRA_ENV=$(printf %q "$EXTRA_ENV")
+
+MAIL=$MAIL
+SLURM_MAIL_TYPE=$SLURM_MAIL_TYPE
+MAIL_EVENTS=$MAIL_EVENTS
+MASTERNODE=$MASTERNODE
+
+MAX_RUNS=$MAX_RUNS
+QUEUE_DEPTH=$QUEUE_DEPTH
+MIN_PROGRESS=$MIN_PROGRESS
+RUNTIME_MARGIN_MIN=$RUNTIME_MARGIN_MIN
+STRICT_CHECKPOINT=$STRICT_CHECKPOINT
+POST_RUN_HOOK=$(printf %q "$POST_RUN_HOOK")
+HOOK_FAILURE_FATAL=$HOOK_FAILURE_FATAL
+EOT
+}
+
+usage_setup() {
+  cat <<EOT
+jw setup [--name N] [--parfile FILE] [--exe FILE] [--partition P] [--time W] [--nodes N]
+         [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE] [--max-runs M] [--queue-depth D]
+         [--min-progress I] [--margin MIN] [--hook SCRIPT] [--mail ADDR] [--mail-events LIST]
+         [--setup-script FILE] [--launcher CMD] [--strict-checkpoint] [--yes]
+Run it in the (empty) directory that will hold the simulation. Missing values are prompted
+for unless --yes is given, in which case the defaults from the cluster config and
+~/.JobWatcher/config are used.
+EOT
+}
+
+# ---------------------------------------------------------------- start / resume
+cmd_start() {
+  need_sim
+  local depth=$QUEUE_DEPTH
+  while [ $# -gt 0 ]; do case $1 in -n) depth=$2; shift 2 ;; *) jw_die "start: unknown option $1" ;; esac; done
+  [ -z "$(jw_last_run_index)" ] || jw_die "runs already exist in $SIMDIR; use 'jw resume' or 'jw status'"
+  [ -e "$SIMDIR/STOP" ] && jw_die "STOP file present; remove it or use 'jw resume'"
+  jw_prepare_run 1 >/dev/null || jw_die "could not prepare Run1"
+  local job; job=$(jw_submit_run 1) || jw_die "submission of Run1 failed"
+  echo "Run1 submitted as job $job"
+  QUEUE_DEPTH=$depth jw_ensure_successors 1 "$job"
+  cmd_status
+}
+
+cmd_resume() {
+  need_sim
+  local depth=$QUEUE_DEPTH
+  while [ $# -gt 0 ]; do case $1 in -n) depth=$2; shift 2 ;; *) jw_die "resume: unknown option $1" ;; esac; done
+  rm -f "$SIMDIR/STOP"
+  local dir n st job last_ok="" last_ok_job="" ts; ts=$(date +%s)
+  # Anything queued or running must be dealt with first.
+  for dir in $(jw_run_dirs); do
+    st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
+    case $st in QUEUED|RUNNING)
+      jw_job_in_queue "$job"; case $? in
+        0) jw_die "$(basename "$dir") (job $job) is still $(jw_job_state "$job"); nothing to resume. Use 'jw stop --kill' first if you really want to restart it." ;;
+        2) jw_die "cannot query Slurm about job $job" ;;
+      esac ;;
+    esac
+  done
+  # Find the last successful run; move everything after it aside.
+  for dir in $(jw_run_dirs); do
+    n=$(jw_run_index "$dir"); st=$(jw_status_get "$dir/status" state)
+    case $st in
+      SUCCESS) last_ok=$n; last_ok_job=$(jw_status_get "$dir/status" jobid) ;;
+      COMPLETE) echo "Run$n reports the simulation COMPLETE; nothing to resume."; return 0 ;;
+    esac
+  done
+  for dir in $(jw_run_dirs); do
+    n=$(jw_run_index "$dir"); (( n > ${last_ok:-0} )) || continue
+    st=$(jw_status_get "$dir/status" state)
+    if jw_remove_unrun_run "$n"; then
+      echo "removed Run$n (state ${st:-empty}, Cactus never ran there)"
+    else
+      echo "moving Run$n (state ${st:-unknown}) to Run$n.failed.$ts"
+      mv "$dir" "$dir.failed.$ts" || jw_die "cannot move $dir"
+      jw_log "Run$n" "$(jw_status_get "$dir.failed.$ts/status" jobid)" MOVED "to Run$n.failed.$ts by jw resume"
+    fi
+  done
+  local next=$(( ${last_ok:-0} + 1 )) ck
+  (( next <= MAX_RUNS )) || jw_die "Run$next would exceed MAX_RUNS=$MAX_RUNS; raise MAX_RUNS in .sim_data/config"
+  ck=$(jw_latest_checkpoint_iter)
+  echo "last successful run: ${last_ok:-none} (iteration $(cat "$SIMDIR/.sim_data/last" 2>/dev/null)); newest checkpoint: ${ck:-none}"
+  jw_prepare_run "$next" >/dev/null || jw_die "could not prepare Run$next"
+  job=$(jw_submit_run "$next" "$last_ok_job") || jw_die "submission of Run$next failed"
+  echo "Run$next submitted as job $job"
+  QUEUE_DEPTH=$depth jw_ensure_successors "$next" "$job"
+  cmd_status
+}
+
+# ---------------------------------------------------------------- stop
+cmd_stop() {
+  need_sim
+  local kill=no dir st job n
+  while [ $# -gt 0 ]; do case $1 in --kill) kill=yes; shift ;; *) jw_die "stop: unknown option $1" ;; esac; done
+  touch "$SIMDIR/STOP"
+  jw_log stop - STOP "STOP file created${kill:+ (kill=$kill)}"
+  for dir in $(jw_run_dirs); do
+    n=$(jw_run_index "$dir"); st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
+    case $st in
+      QUEUED|PREPARED)
+        [ -n "$job" ] && jw_scancel "$job"
+        jw_status_set "$dir/status" state=CANCELLED reason="jw stop" end="$(date +%s)"
+        jw_log "Run$n" "$job" CANCELLED "jw stop"; echo "cancelled Run$n (job ${job:-none})" ;;
+      RUNNING)
+        if [ $kill = yes ]; then
+          jw_scancel "$job"; jw_log "Run$n" "$job" KILLED "jw stop --kill"; echo "killed Run$n (job $job)"
+        else
+          echo "Run$n (job $job) keeps running; it will not queue a successor. Use --kill to cancel it."
+        fi ;;
+    esac
+  done
+  echo "STOP file created in $SIMDIR; 'jw resume' continues the chain."
+}
+
+# ---------------------------------------------------------------- status / log / config / sync
+cmd_status() {
+  need_sim
+  local dir n st job sl it tm el s e r ck
+  echo "Simulation $SIMNAME in $SIMDIR"
+  ck=$(jw_latest_checkpoint_iter)
+  echo "  last successful iteration: $(cat "$SIMDIR/.sim_data/last" 2>/dev/null)   newest checkpoint: ${ck:-none}   STOP: $([ -e "$SIMDIR/STOP" ] && echo present || echo no)"
+  echo "  partition=$PARTITION walltime=$WALLTIME nodes=$NODES tasks/node=$TASKS_PER_NODE cpus/task=$CPUS_PER_TASK queue_depth=$QUEUE_DEPTH max_runs=$MAX_RUNS"
+  printf '  %-7s %-10s %-8s %-10s %-10s %-12s %-9s %s\n' RUN STATE JOB SLURM ITER TIME ELAPSED REASON
+  for dir in $(jw_run_dirs); do
+    n=$(jw_run_index "$dir"); st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
+    it=$(jw_status_get "$dir/status" iter); tm=$(jw_status_get "$dir/status" time); r=$(jw_status_get "$dir/status" reason)
+    s=$(jw_status_get "$dir/status" start); e=$(jw_status_get "$dir/status" end)
+    sl=""; case $st in QUEUED|RUNNING) sl=$(jw_job_state "$job" 2>/dev/null); sl=${sl:-gone} ;; esac
+    el=""; if [ -n "$s" ]; then el=$(( ${e:-$(date +%s)} - s )); el="$(( el / 3600 ))h$(( el % 3600 / 60 ))m"; fi
+    printf '  %-7s %-10s %-8s %-10s %-10s %-12s %-9s %s\n' "Run$n" "${st:-?}" "${job:--}" "${sl:--}" "${it:--}" "${tm:--}" "${el:--}" "${r:0:70}"
+  done
+  ls -d "$SIMDIR"/Run*.failed.* "$SIMDIR"/Run*.stale.* >/dev/null 2>&1 && echo "  (moved aside: $(cd "$SIMDIR" && ls -d Run*.failed.* Run*.stale.* 2>/dev/null | tr '\n' ' '))"
+  return 0
+}
+
+cmd_log()    { need_sim; cat "$SIMDIR/chain.log"; }
+cmd_config() { need_sim; cat "$SIMDIR/.sim_data/config"; }
+cmd_sync() {
+  need_sim
+  local par=no
+  while [ $# -gt 0 ]; do case $1 in --parfile) par=yes; shift ;; *) jw_die "sync: unknown option $1 (only --parfile)" ;; esac; done
+  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$JW_HOME/templates/sub.template" "$SIMDIR/.sim_data/" || jw_die "copy failed"
+  jw_log sync - SYNC "library and template updated from $JW_HOME (jw $JW_VERSION)"
+  echo "updated $SIMDIR/.sim_data from $JW_HOME; runs prepared from now on use the new files"
+  if [ $par = yes ]; then
+    cp "$SIMDIR/.sim_data/parfile.template" "$SIMDIR/.sim_data/parfile.template.bak.$(date +%s)"
+    adapt_parfile "$SIMDIR/.sim_data/parfile.template"
+    jw_log sync - ADAPT "parfile.template re-adapted (backup kept)"
+  fi
+}
+
+usage() { sed -n '2,15p' "$JW_BIN" | sed 's/^# \{0,1\}//'; }
+
+case ${1:-help} in
+  setup)  shift; cmd_setup "$@" ;;
+  start)  shift; cmd_start "$@" ;;
+  resume) shift; cmd_resume "$@" ;;
+  stop)   shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  log)    shift; cmd_log ;;
+  config) shift; cmd_config ;;
+  sync)   shift; cmd_sync "$@" ;;
+  help|-h|--help) usage ;;
+  *) echo "jw: unknown command '$1'" >&2; usage; exit 1 ;;
+esac

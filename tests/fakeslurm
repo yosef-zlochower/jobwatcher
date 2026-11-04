@@ -1,0 +1,73 @@
+#!/bin/bash
+# fakeslurm - a tiny stand-in for sbatch/squeue/scancel/srun/mail used by run_tests.sh.
+# Installed as symlinks named after the real commands; dispatches on $0.
+# State lives in $FAKE_SLURM_DIR/jobs/<id> (key=value lines) and $FAKE_SLURM_DIR/next_id.
+
+set -u
+Q=${FAKE_SLURM_DIR:?FAKE_SLURM_DIR not set}
+mkdir -p "$Q/jobs"
+getk() { sed -n "s/^$2=//p" "$Q/jobs/$1" 2>/dev/null | tail -n1; }
+setk() { local f="$Q/jobs/$1"; { [ -f "$f" ] && grep -v "^$2=" "$f"; echo "$2=$3"; } > "$f.tmp"; mv -f "$f.tmp" "$f"; }
+
+case $(basename "$0") in
+  sbatch)
+    dep=""; kill=no; script=""; parsable=no
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --parsable) parsable=yes; shift ;;
+        --dependency=afterok:*) dep=${1#--dependency=afterok:}; shift ;;
+        --kill-on-invalid-dep=yes) kill=yes; shift ;;
+        --*) shift ;;
+        *) script=$1; shift ;;
+      esac
+    done
+    [ -f "$script" ] || { echo "sbatch: error: Unable to open file $script" >&2; exit 1; }
+    if [ -n "$dep" ] && [ ! -f "$Q/jobs/$dep" ]; then echo "sbatch: error: Job dependency problem" >&2; exit 1; fi
+    id=$(( $(cat "$Q/next_id" 2>/dev/null || echo 100) )); echo $(( id + 1 )) > "$Q/next_id"
+    { echo "state=PENDING"; echo "script=$script"; echo "cwd=$PWD"; echo "dep=$dep"; echo "kill=$kill"; } > "$Q/jobs/$id"
+    [ $parsable = yes ] && echo "$id" || echo "Submitted batch job $id"
+    ;;
+  squeue)
+    id=""; while [ $# -gt 0 ]; do case $1 in -j) id=$2; shift 2 ;; *) shift ;; esac; done
+    [ -n "$id" ] && [ -f "$Q/jobs/$id" ] && getk "$id" state
+    exit 0 ;;
+  scancel)
+    for id in "$@"; do [ -f "$Q/jobs/$id" ] && setk "$id" state CANCELLED; done ;;
+  srun)
+    while [ $# -gt 0 ]; do case $1 in --*) shift ;; *) break ;; esac; done
+    exec "$@" ;;
+  mail)
+    subj=""; while [ $# -gt 0 ]; do case $1 in -s) subj=$2; shift 2 ;; *) to=$1; shift ;; esac; done
+    { echo "=== MAIL to ${to:-?}: $subj"; cat; echo; } >> "$Q/mail.log" ;;
+  runqueue)
+    # Run pending jobs whose dependency is satisfied, lowest id first, until nothing is runnable.
+    # --one: run at most one job.
+    one=no; [ "${1:-}" = --one ] && one=yes
+    while :; do
+      ran=no
+      for f in $(ls "$Q/jobs" 2>/dev/null | sort -n); do
+        [ "$(getk "$f" state)" = PENDING ] || continue
+        dep=$(getk "$f" dep)
+        if [ -n "$dep" ]; then
+          case $(getk "$dep" state) in
+            COMPLETED) ;;
+            FAILED|CANCELLED|TIMEOUT) setk "$f" state CANCELLED; echo "fakeslurm: job $f cancelled (dependency $dep failed)"; continue ;;
+            *) continue ;;
+          esac
+        fi
+        setk "$f" state RUNNING
+        cwd=$(getk "$f" cwd); script=$(getk "$f" script)
+        echo "fakeslurm: running job $f in $cwd"
+        ( cd "$cwd" && SLURM_JOB_ID=$f SLURM_SUBMIT_DIR=$cwd SLURM_JOB_NODELIST=fake-n0001 SLURM_JOB_PARTITION=fake \
+            bash "$script" > "stdout_$f.out" 2>&1 )
+        rc=$?
+        [ $rc -eq 0 ] && setk "$f" state COMPLETED || setk "$f" state FAILED
+        echo "fakeslurm: job $f finished rc=$rc"
+        ran=yes
+        break
+      done
+      [ $ran = yes ] || break
+      [ $one = yes ] && break
+    done ;;
+  *) echo "fakeslurm: unknown command $(basename "$0")" >&2; exit 1 ;;
+esac
