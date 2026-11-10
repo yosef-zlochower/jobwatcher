@@ -78,7 +78,7 @@ if (( RUN > 1 )); then
   PITER=$(jw_status_get "$PREV_DIR/status" iter)
   CK=$(jw_latest_checkpoint_iter)
   [ -n "$CK" ] || fail "no checkpoint files found in $CHECKPOINT_DIR"
-  if [ -n "$PITER" ] && [ "$CK" != "$PITER" ]; then
+  if [[ $PITER =~ ^[0-9]+$ && $CK =~ ^[0-9]+$ ]] && (( 10#$CK != 10#$PITER )); then
     if [ "$STRICT_CHECKPOINT" = yes ]; then
       fail "newest checkpoint is iteration $CK but predecessor terminated at $PITER (STRICT_CHECKPOINT=yes)"
     else
@@ -100,12 +100,23 @@ else
 fi
 
 # ---------------------------------------------------------------- 4. launch
+# Jobs are submitted with --export=$SBATCH_EXPORT (NONE by default: Slurm then gives the job a
+# fresh login environment instead of a copy of the submitter's, so every run sees the same
+# environment whether it was submitted from the login node or from its predecessor's job).
+# ENV_INIT (cluster config) runs first, e.g. to define `module`; then SETUP_SCRIPT; then EXTRA_ENV.
+[ -n "$ENV_INIT" ] && eval "$ENV_INIT"
 if [ -n "$SETUP_SCRIPT" ]; then
   # shellcheck disable=SC1090
-  source "$SETUP_SCRIPT" >/dev/null 2>&1 || jw_warn "sourcing $SETUP_SCRIPT returned non-zero"
+  source "$SETUP_SCRIPT" > "env_setup_${JOBID}.log" 2>&1 || jw_warn "sourcing $SETUP_SCRIPT returned non-zero (see env_setup_${JOBID}.log)"
 fi
 export OMP_NUM_THREADS=$CPUS_PER_TASK OMP_PROC_BIND OMP_PLACES
 [ -n "$EXTRA_ENV" ] && eval "$EXTRA_ENV"
+# sbatch --export=NONE leaves SLURM_EXPORT_ENV=NONE in the job, and srun would then start the
+# Cactus tasks with an empty environment (no HOME, no PATH: PMIx/MPI_Init fails). The tasks must
+# get the environment built above, so tell srun to export everything.
+export SLURM_EXPORT_ENV=ALL
+env | sort > "env_${JOBID}.txt"
+echo "environment: $(wc -l < "env_${JOBID}.txt") variables, module=$(type -t module 2>/dev/null || echo undefined), SPACK_ENV=${SPACK_ENV:-unset}, unresolved shared libraries of ./$EXE: $(ldd "./$EXE" 2>/dev/null | grep -c 'not found') (env_${JOBID}.txt, env_setup_${JOBID}.log)"
 { mail_body "JobWatcher: $SIMNAME Run$RUN started" ; } | jw_mail start "[jw] $SIMNAME Run$RUN started"
 
 echo "launch: $LAUNCHER ./$EXE $PARFILE  (OMP_NUM_THREADS=$OMP_NUM_THREADS) at $(date)"
@@ -115,23 +126,24 @@ RC=$?
 echo "launcher exit code $RC after $(( $(date +%s) - T_LAUNCH )) s at $(date)"
 
 # ---------------------------------------------------------------- 5. classify
-TERM_LINE=$(grep -E 'Dumping termination checkpoint at iteration [0-9]+' "$CACTUS_OUT" | tail -n1)
-ITER=$(sed -n 's/.*Dumping termination checkpoint at iteration \([0-9]*\).*/\1/p' <<<"$TERM_LINE")
-STIME=$(sed -n 's/.*simulation time \([-+0-9.eE]*\).*/\1/p' <<<"$TERM_LINE")
+ITER=""; STIME=""
+if TERM_INFO=$(jw_term_checkpoint "$CACTUS_OUT"); then ITER=${TERM_INFO%% *}; STIME=${TERM_INFO#* }; [ "$STIME" = "$TERM_INFO" ] && STIME=""; fi
 
 if [ -z "$ITER" ]; then
   if grep -q 'DUE TO TIME LIMIT' "$CACTUS_OUT" 2>/dev/null; then
     fail "killed by Slurm time limit before writing a termination checkpoint (launcher rc=$RC); lower cactus::max_runtime or raise RUNTIME_MARGIN_MIN"
   fi
-  fail "no termination checkpoint in $CACTUS_OUT (launcher rc=$RC): crash, kill, or IO::checkpoint_on_terminate is not yes"
+  fail "no termination checkpoint announced in $CACTUS_OUT (driver $DRIVER, launcher rc=$RC): crash, kill, or IO::checkpoint_on_terminate is not yes"
 fi
-[ "$RC" -eq 0 ] || fail "termination checkpoint written at iteration $ITER but launcher exited with code $RC"
-jw_checkpoint_exists "$ITER" || fail "termination checkpoint at iteration $ITER was announced but no file *.chkpt.it_${ITER}.* exists in $CHECKPOINT_DIR"
+[ "$RC" -eq 0 ] || fail "termination checkpoint at iteration $ITER but launcher exited with code $RC"
+CKPT_METHOD=$(jw_par_get "$PARFILE" 'CarpetX::checkpoint_method' | tr 'A-Z' 'a-z')
+WRITE_PROBLEM=$(jw_term_write_ok "$CACTUS_OUT" "$ITER" "${CKPT_METHOD:-openpmd}") || fail "termination checkpoint at iteration $ITER was announced but $WRITE_PROBLEM"
+jw_checkpoint_exists "$ITER" || fail "termination checkpoint at iteration $ITER was announced but no file matching $(jw_checkpoint_pattern) exists for it in $CHECKPOINT_DIR"
 
 # Did the simulation reach its final iteration/time?  (cactus::terminate = iteration | time | any | all | runtime | never)
 TERM_MODE=$(jw_par_get "$PARFILE" 'cactus::terminate' | tr 'A-Z' 'a-z')
-ITLAST=$(jw_num "$(jw_par_get "$PARFILE" 'cactus::cctk_itlast')")
-FTIME=$(jw_num "$(jw_par_get "$PARFILE" 'cactus::cctk_final_time')")
+ITLAST=$(jw_num "$(jw_par_value "$PARFILE" 'cactus::cctk_itlast')")
+FTIME=$(jw_num "$(jw_par_value "$PARFILE" 'cactus::cctk_final_time')")
 # non-positive limits mean "no such condition"
 [ -n "$ITLAST" ] && ! awk "BEGIN{exit !($ITLAST > 0)}" && ITLAST=""
 [ -n "$FTIME" ]  && ! awk "BEGIN{exit !($FTIME > 0)}"  && FTIME=""

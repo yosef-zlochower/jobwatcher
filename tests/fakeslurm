@@ -29,7 +29,9 @@ case $(basename "$0") in
     ;;
   squeue)
     id=""; while [ $# -gt 0 ]; do case $1 in -j) id=$2; shift 2 ;; *) shift ;; esac; done
-    [ -n "$id" ] && [ -f "$Q/jobs/$id" ] && getk "$id" state
+    # Like real Slurm: a job the controller does not know exits 1 with this message.
+    if [ -n "$id" ] && [ ! -f "$Q/jobs/$id" ]; then echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; fi
+    [ -n "$id" ] && getk "$id" state
     exit 0 ;;
   scancel)
     for id in "$@"; do [ -f "$Q/jobs/$id" ] && setk "$id" state CANCELLED; done ;;

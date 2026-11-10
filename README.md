@@ -36,19 +36,25 @@ jw setup --name q1 --parfile ~/pars/q1.par --exe /lustre/yosef/NewCluster/Kruska
 jw start
 ```
 
-`jw setup` copies the executable and the parfile into `.sim_data/`, and **adapts the parfile
+`jw setup` copies the executable and the parfile into `.sim_data/`, detects the **driver**
+(`carpet` or `carpetx`, from `ActiveThorns`; override with `--driver`), and **adapts the parfile
 template** so that JobWatcher controls restarts (it prints every change it makes):
 
 | Parameter | Set to | Why |
 |---|---|---|
 | `IO::checkpoint_dir`, `IO::recover_dir` | `@REP{CHECKPOINT_DIR}` = `<simdir>/CheckPoint` | one shared checkpoint directory for all runs |
 | `cactus::max_runtime` | `@REP{MAX_RUNTIME}` = walltime − `RUNTIME_MARGIN_MIN` | Cactus stops itself before Slurm kills the job |
-| `cactus::terminate` | `"any"` if the parfile has a positive `cctk_itlast` / `cctk_final_time`, else `"runtime"` | runs stop on runtime; the chain ends when the final condition is reached |
+| `cactus::terminate` | `"any"` if the parfile's mode has a positive `cctk_itlast` / `cctk_final_time`, else `"runtime"`; the condition the original mode did not use gets an unreachable sentinel | runs stop on runtime; the chain ends when the final condition is reached |
 | `IO::recover` | `"autoprobe"` | each run recovers from the newest checkpoint |
-| `IO::checkpoint_on_terminate`, `CarpetIOHDF5::checkpoint` | `yes` | the termination checkpoint is how progress is measured |
+| `IO::checkpoint_on_terminate` | `yes` | the termination checkpoint is how progress is measured |
+| `CarpetIOHDF5::checkpoint` (Carpet) | `"yes"` | enables checkpointing |
+| `CarpetX::checkpoint_method`, `recover_method` (CarpetX) | `"openpmd"` when unset or `"error"` (the thorn default, which aborts at the first checkpoint); an explicit `"silo"` is kept | enables checkpointing |
+| `TerminationTrigger::max_walltime`, `on_remaining_walltime` (if the thorn is active) | `@REP{WALLTIME_HOURS}`, `@REP{RUNTIME_MARGIN_MIN}` | the trigger follows `WALLTIME` instead of a hard-coded value and fires when `cactus::max_runtime` does |
 
+Parfile variables (`$itlast = 64 * 16`) are resolved when the final condition is inspected.
 Placeholders may also be written into the parfile by hand: `@REP{CHECKPOINT_DIR}`,
-`@REP{MAX_RUNTIME}`, `@REP{SIMDIR}`, `@REP{SIMNAME}`, `@REP{RUN}`, `@REP{DATADIRNAME}`.
+`@REP{MAX_RUNTIME}`, `@REP{WALLTIME_HOURS}`, `@REP{RUNTIME_MARGIN_MIN}`, `@REP{SIMDIR}`,
+`@REP{SIMNAME}`, `@REP{RUN}`, `@REP{DATADIRNAME}`.
 
 ## Layout of a simulation
 
@@ -69,6 +75,7 @@ Placeholders may also be written into the parfile by hand: `@REP{CHECKPOINT_DIR}
      status                   key=value: state, jobid, iter, time, reason, start, end, depends
      stdout_<job>.out         JobWatcher trace (what the job did and decided)
      cactus_<job>.out         Cactus output (what the classification parses)
+     env_<job>.txt, env_setup_<job>.log   environment the job launched with; SETUP_SCRIPT output
      <DATADIRNAME>/           Cactus IO::out_dir
   RunN.failed.<ts>/           failed runs moved aside by `jw resume`
 ```
@@ -86,12 +93,15 @@ States: `PREPARED → QUEUED → RUNNING → SUCCESS | COMPLETE | FAILED | STOPP
    `--dependency=afterok:<previous> --kill-on-invalid-dep=yes`. Successors are prepared from the
    *current* `.sim_data/config`, so walltime, nodes, partition and the executable can change
    between runs. Nothing is queued past `MAX_RUNS` or while `STOP` exists.
-4. Sources `SETUP_SCRIPT`, exports `OMP_*`, runs `LAUNCHER ./EXE PARFILE > cactus_<job>.out`.
-5. Classifies: no `Dumping termination checkpoint at iteration N` line, a non-zero launcher
-   exit, or a missing checkpoint file → `FAILED`. Iteration ≥ `cctk_itlast` or time ≥
-   `cctk_final_time` (per `cactus::terminate`) → `COMPLETE`. Fewer than `MIN_PROGRESS` new
-   iterations → `FAILED` (this is also what you see if a `terminate = "runtime"` simulation is
-   really finished: use `jw stop`). Otherwise `SUCCESS` and `.sim_data/last` is updated.
+4. Builds the environment: evaluates `ENV_INIT`, sources `SETUP_SCRIPT` (output in
+   `env_setup_<job>.log`), exports `OMP_*`, evaluates `EXTRA_ENV`, records the result in
+   `env_<job>.txt`, then runs `LAUNCHER ./EXE PARFILE > cactus_<job>.out`.
+5. Classifies: no termination-checkpoint announcement, a non-zero launcher exit, an announced but
+   unconfirmed write (CarpetX only, see below), or a missing checkpoint → `FAILED`. Iteration ≥
+   `cctk_itlast` or time ≥ `cctk_final_time` (per `cactus::terminate`) → `COMPLETE`. Fewer than
+   `MIN_PROGRESS` new iterations → `FAILED` (this is also what you see if a
+   `terminate = "runtime"` simulation is really finished: use `jw stop`). Otherwise `SUCCESS` and
+   `.sim_data/last` is updated.
 6. `COMPLETE`, `FAILED` and `STOPPED` cancel every queued successor explicitly; a `FAILED` job
    also exits 1 so Slurm's `afterok` can never fire. Slurm's own `--mail-type=FAIL` mail plus
    JobWatcher's summary mail (events chosen by `MAIL_EVENTS`, with the tail of the Cactus
@@ -102,6 +112,22 @@ Because the successor is queued at the *start* of a run it accrues queue priorit
 run executes; if the run is killed by the time limit or a node failure, its exit status is
 non-zero and the successor is cancelled by Slurm. `jw status` then shows `RUNNING`/`gone`
 and `jw resume` restarts from the last successful run.
+
+### Drivers: Carpet and CarpetX
+
+`DRIVER` in `.sim_data/config` selects how the termination checkpoint is recognised:
+
+| | Carpet (`CarpetIOHDF5`) | CarpetX |
+|---|---|---|
+| announcement in the Cactus output | `Dumping termination checkpoint at iteration N, simulation time T` (printed after the write) | `Checkpointing before terminating at iteration N, time T, run time H h` (printed *before* the write) |
+| write confirmed by | the announcement itself | CarpetX prints nothing when the checkpoint is finished, so the proof is Cactus's clean shutdown line `Done.` after the announcement (a job killed inside the write never gets there); also accepted: `Already wrote checkpoint at iteration N; skipping checkpointing` (a periodic checkpoint coincided), `Recovered from checkpoint at iteration N; skipping checkpointing` (no progress: `MIN_PROGRESS` then fails the run), and `OutputOpenPMD done.` from older CarpetX versions |
+| checkpoint on disk | `<file>.chkpt.it_N[.file_P].h5` | `<file>.chkpt.itNNNNNNNN.{bp5,bp4,bp,h5,silo}` (zero padded; BP5 is a directory). The `<file>.openpmd.visit` index and anything with another suffix (e.g. a directory renamed to `.bp5_bad`) is ignored |
+
+An announcement without a confirmation means Cactus died inside the checkpoint write: the run is
+`FAILED` and the incomplete directory stays on disk (JobWatcher never deletes checkpoints; note
+that CarpetX ignores `IO::checkpoint_keep`, so prune `CheckPoint/` by hand). Because `IO::recover
+= "autoprobe"` picks the newest checkpoint, check `CheckPoint/` before `jw resume` after such a
+failure.
 
 ## Operating
 
@@ -115,7 +141,9 @@ and `jw resume` restarts from the last successful run.
   `PARTITION`, `EXE` after copying a new executable into `.sim_data/`). The next successor that is
   *prepared* uses them; an already-queued successor does not (cancel it with `jw stop`, then
   `jw resume`).
-- **Upgrade the scripts in a running simulation:** `jw sync`.
+- **Upgrade the scripts in a running simulation:** `jw sync`. Every job that starts afterwards,
+  including successors that are already queued, executes the new `jw_job.sh` (the batch script
+  `exec`s it from `.sim_data` at run time).
 - **Finish by hand:** `jw stop`, or set a final condition in `.sim_data/parfile.template`.
 
 ## Hooks
@@ -149,12 +177,23 @@ inside the job, on the allocated node, after the termination checkpoint; allow f
 - Finished jobs stay visible to `squeue` for `MinJobAge` (5 min); after that a dependency on
   them cannot be expressed, which is why `jw resume` submits without a dependency when the
   predecessor is gone.
+- Jobs are submitted with `--export=NONE` (`SBATCH_EXPORT`), so Slurm gives every job a fresh
+  login environment instead of a copy of the submitter's; a successor submitted from inside a
+  running job therefore sees exactly what a job submitted from the login node sees (verified
+  2026-11-10 with probe jobs: identical environments, nothing inherited from the parent job). The
+  job then evaluates `ENV_INIT` (defines `module`, since `/etc/profile.d/lmod.sh` is a no-op under
+  Slurm), sources `SETUP_SCRIPT` and sets `SLURM_EXPORT_ENV=ALL` so that `srun` passes that
+  environment to the Cactus tasks (with `NONE` still in force the tasks would start without
+  `HOME`/`PATH` and OpenMPI's `MPI_Init` fails with "Unable to get the user home directory").
 
 ## Tests
 
 `tests/run_tests.sh` runs `jw` against a fake Slurm (`tests/fakeslurm`) and a fake Cactus
 (`tests/fakecactus`) that mimics recovery, termination checkpoints and crashes. It covers:
-walltime parsing and templating; a chain that completes at `cctk_itlast` and cancels its
-queued successor; a crash in Run2 with cancellation of Run3, `jw resume`, and `MAX_RUNS`;
-`jw stop`/`jw resume`; a no-progress failure; an announced-but-missing checkpoint file; and
-`jw resume` refusing while a job is queued.
+walltime parsing, templating and parfile-variable resolution; a chain that completes at
+`cctk_itlast` and cancels its queued successor; a crash in Run2 with cancellation of Run3,
+`jw resume`, and `MAX_RUNS`; `jw stop`/`jw resume`; a no-progress failure; an
+announced-but-missing checkpoint file; `jw resume` refusing while a job is queued; jobs forgotten
+by the controller after `MinJobAge`; and a CarpetX chain (`FAKE_DRIVER=carpetx`: padded `.bp5`
+directories, completion by `cctk_final_time` given as a parfile variable, a write killed before
+`OutputOpenPMD done.`, the "Already wrote"/"Recovered from" skip lines).

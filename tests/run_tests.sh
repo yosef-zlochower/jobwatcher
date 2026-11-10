@@ -52,6 +52,12 @@ check "walltime 90 -> 90"          '[ "$(jw_walltime_minutes 90)" = 90 ]'
 check "walltime 08:30:00 -> 510"   '[ "$(jw_walltime_minutes 08:30:00)" = 510 ]'
 printf 'a=@REP{X} b=@REP{Y}\n' > "$T/tpl"; X='/path/with/slashes & ampersand' Y='$NN' jw_fill_template "$T/tpl" "$T/out" X Y
 check "template keeps / & and \$"  '[ "$(cat "$T/out")" = "a=/path/with/slashes & ampersand b=\$NN" ]'
+printf 'IO::out_dir = "data#1" # trailing comment\nIO::recover = autoprobe # c\n' > "$T/par0"
+check "par_get keeps # inside quotes, strips comments" '[ "$(jw_par_get "$T/par0" IO::out_dir)" = "data#1" ] && [ "$(jw_par_get "$T/par0" IO::recover)" = autoprobe ]'
+check "walltime rejects garbage"     '! jw_walltime_minutes "two days" 2>/dev/null'
+printf '$itlast = 64 * 16\n$final_time = 1000\nCactus::cctk_itlast = $itlast\nCactus::cctk_final_time = $final_time\n' > "$T/par1"
+check "job exports the environment to srun tasks despite --export=NONE" 'grep -q "^export SLURM_EXPORT_ENV=ALL" "$JW_HOME/lib/jw_job.sh"'
+check "par_value resolves parfile variables" '[ "$(jw_num "$(jw_par_value "$T/par1" cactus::cctk_itlast)")" = 1024 ] && [ "$(jw_num "$(jw_par_value "$T/par1" cactus::cctk_final_time)")" = 1000 ]'
 
 echo "== scenario A: chain runs to completion (cctk_itlast reached) and cancels the queued successor"
 A=$T/simA; mkdir -p "$A"; mkpar "$T/bbh.par" 1700
@@ -119,6 +125,81 @@ check "chain continues, recovering from the periodic checkpoint 510 (non-strict)
       '[ "$(state "$C/Run2")" = SUCCESS ] && [ "$(cat "$C/.sim_data/last")" = 1010 ] && grep -q "newest checkpoint is iteration 510" "$C/Run2/stdout_"*.out'
 check "resume refuses while a job is queued" '! ( cd "$C" && "$JW" resume > resume4.log 2>&1 ) && grep -q "still" "$C/resume4.log"'
 check "log has START/SUCCESS/FAILED/MOVED events" 'grep -q " START " "$C/chain.log" && grep -q " FAILED " "$C/chain.log" && grep -q " MOVED " "$C/chain.log"'
+
+echo "== scenario D: jobs forgotten by the controller (MinJobAge), STOP kept when resume refuses"
+( cd "$C" && "$JW" stop > stop2.log 2>&1 )     # the fake queue is shared: cancel C's queued Run3 so it cannot run here
+D=$T/simD; mkdir -p "$D"; mkpar "$T/bbh.par" 0
+( cd "$D" && "$JW" setup --yes --name simD --parfile "$T/bbh.par" --exe "$JW_HOME/tests/fakecactus" --max-runs 10 > setup.log 2>&1 ) || fail "setup D"
+( cd "$D" && "$JW" start > start.log 2>&1 ) || fail "start D"
+runqueue --one > "$D/queue1.log" 2>&1
+check "after one job: Run1 SUCCESS, Run2 QUEUED" '[ "$(state "$D/Run1")" = SUCCESS ] && [ "$(state "$D/Run2")" = QUEUED ]'
+touch "$D/STOP"
+check "resume refuses while Run2 is queued and leaves STOP in place" '! ( cd "$D" && "$JW" resume > resume0.log 2>&1 ) && grep -q "still" "$D/resume0.log" && [ -e "$D/STOP" ]'
+# Pretend Run2 started, was killed by the time limit, and more than MinJobAge has passed: squeue no longer knows either job.
+j1=$(sed -n 's/^jobid=//p' "$D/Run1/status" | tail -n1); j2=$(sed -n 's/^jobid=//p' "$D/Run2/status" | tail -n1)
+sed -i 's/^state=.*/state=RUNNING/' "$D/Run2/status"; rm -f "$FAKE_SLURM_DIR/jobs/$j1" "$FAKE_SLURM_DIR/jobs/$j2"
+check "status shows the lost run as gone" '( cd "$D" && "$JW" status > status.log 2>&1 ) && grep -q "Run2 *RUNNING *[0-9]* *gone" "$D/status.log"'
+( cd "$D" && "$JW" resume > resume1.log 2>&1 ) || { fail "resume D with forgotten jobs"; cat "$D/resume1.log"; }
+check "resume moved the lost Run2 aside, removed STOP, re-queued Run2 without dependency" \
+      'ls -d "$D"/Run2.failed.* >/dev/null 2>&1 && [ ! -e "$D/STOP" ] && [ "$(state "$D/Run2")" = QUEUED ] && grep -q "^depends=none" "$D/Run2/status"'
+runqueue --one > "$D/queue2.log" 2>&1
+check "chain continues after resume: Run2 SUCCESS at 1000" '[ "$(state "$D/Run2")" = SUCCESS ] && [ "$(cat "$D/.sim_data/last")" = 1000 ]'
+
+echo "== scenario E: CarpetX driver (padded .bp5 checkpoint directories, announce-then-confirm termination)"
+( cd "$D" && "$JW" stop > stop2.log 2>&1 )     # cancel D's queued Run3 (shared fake queue)
+mkparx() {  # <file> <final_time>
+cat > "$1" <<EOF
+ActiveThorns = "
+  CarpetX IOUtil
+  TerminationTrigger
+"
+\$final_time = $2
+IO::out_dir = \$parfile
+Cactus::terminate = "time"
+Cactus::cctk_final_time = \$final_time
+Cactus::cctk_itlast = 64       # ignored by terminate = "time", must not survive the switch to "any"
+IO::checkpoint_every = 512
+IO::checkpoint_on_terminate = no
+IO::checkpoint_dir = "checkpoint"
+IO::recover_dir = "checkpoint"
+IO::recover = "autoprobe"
+CarpetX::checkpoint_method = "error"
+TerminationTrigger::max_walltime = 48
+TerminationTrigger::on_remaining_walltime = 30
+EOF
+}
+export FAKE_DRIVER=carpetx
+E=$T/simE; mkdir -p "$E"; mkparx "$T/bbhx.par" 1.0
+( cd "$E" && "$JW" setup --yes --name simE --parfile "$T/bbhx.par" --exe "$JW_HOME/tests/fakecactus" --max-runs 10 > setup.log 2>&1 ) || { fail "setup E"; cat "$E/setup.log"; }
+check "driver detected from ActiveThorns" 'grep -q "^DRIVER=carpetx$" "$E/.sim_data/config" && grep -q "driver: carpetx" "$E/setup.log"'
+check "CarpetX checkpoint/recover method set to openpmd, no CarpetIOHDF5 line" \
+      'grep -q "CarpetX::checkpoint_method = \"openpmd\"" "$E/.sim_data/parfile.template" && grep -q "CarpetX::recover_method = \"openpmd\"" "$E/.sim_data/parfile.template" && ! grep -q CarpetIOHDF5 "$E/.sim_data/parfile.template"'
+check "terminate time -> any keeps \$final_time, itlast gets the sentinel" 'grep -q "cactus::cctk_itlast = 1000000000" "$E/.sim_data/parfile.template" && grep -q "cctk_final_time = \$final_time" "$E/.sim_data/parfile.template"'
+check "TerminationTrigger follows WALLTIME and the margin" 'grep -q "TerminationTrigger::max_walltime = @REP{WALLTIME_HOURS}" "$E/.sim_data/parfile.template"'
+check "sbatch is called with --export=NONE" 'grep -q "^SBATCH_EXPORT=NONE$" "$E/.sim_data/config"'
+( cd "$E" && "$JW" start > start.log 2>&1 ) || { fail "start E"; cat "$E/start.log"; }
+check "filled parfile: max_walltime 1 h, on_remaining_walltime 5" 'grep -q "TerminationTrigger::max_walltime = 1$" "$E/Run1/bbhx.par" && grep -q "TerminationTrigger::on_remaining_walltime = 5$" "$E/Run1/bbhx.par"'
+runqueue > "$E/queue.log" 2>&1
+check "Run1,2 SUCCESS, Run3 COMPLETE at t>=1.0, Run4 cancelled" '[ "$(state "$E/Run1")" = SUCCESS ] && [ "$(state "$E/Run2")" = SUCCESS ] && [ "$(state "$E/Run3")" = COMPLETE ] && [ "$(state "$E/Run4")" = CANCELLED ]'
+check "padded bp5 directories, last = 1500" '[ -d "$E/CheckPoint/checkpoint.chkpt.it00001500.bp5" ] && [ "$(cat "$E/.sim_data/last")" = 1500 ]'
+mkdir -p "$E/CheckPoint/checkpoint.chkpt.it00009999.bp5_bad"
+check "status ignores .openpmd.visit and a renamed _bad directory" '( cd "$E" && "$JW" status > status.log 2>&1 ) && grep -q "newest checkpoint: 1500 " "$E/status.log"'
+check "Run2 recovered from the padded checkpoint 500" 'grep -q "Recovering from checkpoint at iteration 500" "$E/Run2/cactus_"*.out'
+
+E2=$T/simE2; mkdir -p "$E2"; mkparx "$T/bbhx2.par" 1000
+( cd "$E2" && "$JW" setup --yes --name simE2 --parfile "$T/bbhx2.par" --exe "$JW_HOME/tests/fakecactus" --max-runs 10 > setup.log 2>&1 ) || fail "setup E2"
+( cd "$E2" && "$JW" start > start.log 2>&1 ) || fail "start E2"
+runqueue --one > "$E2/queue1.log" 2>&1
+FAKE_NODONE=1 runqueue --one > "$E2/queue2.log" 2>&1
+check "announced but unconfirmed write (killed inside it) -> FAILED, successor cancelled, last kept" \
+      '[ "$(state "$E2/Run2")" = FAILED ] && grep -q "never confirmed" "$E2/Run2/status" && [ "$(state "$E2/Run3")" = CANCELLED ] && [ "$(cat "$E2/.sim_data/last")" = 500 ]'
+check "the incomplete directory is left on disk (never deleted)" '[ -d "$E2/CheckPoint/checkpoint.chkpt.it00001000.bp5" ]'
+( cd "$E2" && "$JW" resume > resume1.log 2>&1 ) || { fail "resume E2"; cat "$E2/resume1.log"; }
+FAKE_ALREADY=1 runqueue --one > "$E2/queue3.log" 2>&1
+check "'Already wrote checkpoint ... skipping' counts as a confirmed write: Run2 SUCCESS at 1500" '[ "$(state "$E2/Run2")" = SUCCESS ] && grep -q "^iter=1500" "$E2/Run2/status"'
+FAKE_STEP=0 runqueue --one > "$E2/queue4.log" 2>&1
+check "'Recovered from checkpoint ... skipping' (no progress) -> FAILED by MIN_PROGRESS" '[ "$(state "$E2/Run3")" = FAILED ] && grep -q "MIN_PROGRESS" "$E2/Run3/status"'
+unset FAKE_DRIVER
 
 echo
 echo "passed: $pass  failed: $failn  (workdir $T)"

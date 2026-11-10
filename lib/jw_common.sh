@@ -21,6 +21,7 @@ jw_apply_defaults() {
   : "${MAX_RUNS:=100}" "${QUEUE_DEPTH:=1}" "${MIN_PROGRESS:=100}"
   : "${RUNTIME_MARGIN_MIN:=20}" "${STRICT_CHECKPOINT:=no}"
   : "${POST_RUN_HOOK:=}" "${HOOK_FAILURE_FATAL:=no}"
+  : "${DRIVER:=carpet}" "${SBATCH_EXPORT:=NONE}" "${ENV_INIT:=}"
 }
 
 # ---------------------------------------------------------------- simulation
@@ -53,11 +54,11 @@ jw_last_run_index() { jw_run_dirs | sed 's/.*Run//' | tail -n1; }
 # ---------------------------------------------------------------- status files
 # A status file is a set of key=value lines; the last occurrence of a key wins.
 jw_status_set() {           # <file> key=value ...
-  local f=$1 kv k; shift
-  for kv in "$@"; do
-    k=${kv%%=*}
-    { [ -f "$f" ] && grep -v "^$k=" "$f"; printf '%s\n' "$kv"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
-  done
+  local f=$1 kv k pat="" tmp; shift
+  [ $# -gt 0 ] || return 0
+  for kv in "$@"; do k=${kv%%=*}; pat+="${pat:+|}$k"; done
+  tmp="$f.tmp.$$"           # unique per writer: the login node and the job may update the same file
+  { [ -f "$f" ] && grep -Ev "^($pat)=" "$f"; printf '%s\n' "$@"; } > "$tmp" && mv -f "$tmp" "$f"
 }
 jw_status_get() {           # <file> <key>
   [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | tail -n1
@@ -98,14 +99,36 @@ jw_walltime_minutes() {
       3) IFS=: read -r h m s <<<"$w" ;;
     esac
   fi
+  [[ "${d:-0}${h:-0}${m:-0}${s:-0}" =~ ^[0-9]+$ ]] || { jw_warn "invalid walltime '$1' (expected [D-]HH:MM:SS)"; return 1; }
   echo $(( 10#${d:-0}*1440 + 10#${h:-0}*60 + 10#${m:-0} ))
 }
 
 # ---------------------------------------------------------------- parfile
 # jw_par_get <parfile> <param>: value of the last assignment (comments and quotes stripped).
 jw_par_get() {
-  grep -iE "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null | tail -n1 |
-    sed -e 's/#.*//' -e 's/^[^=]*=[[:space:]]*//' -e 's/^"//' -e 's/"[[:space:]]*$//' -e 's/[[:space:]]*$//'
+  local v
+  v=$(grep -iE "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null | tail -n1)
+  [ -n "$v" ] || return 0
+  v=${v#*=}; v=${v#"${v%%[![:space:]]*}"}            # drop 'name =' and leading blanks
+  if [[ $v == \"* ]]; then
+    v=${v#\"}; v=${v%%\"*}                           # quoted: everything up to the closing quote ('#' allowed)
+  else
+    v=${v%%#*}; v=${v%"${v##*[![:space:]]}"}         # unquoted: strip comment and trailing blanks
+  fi
+  printf '%s\n' "$v"
+}
+# jw_par_value <parfile> <param>: like jw_par_get, with parfile variables ($name = ...) substituted,
+# each definition wrapped in parentheses so that jw_num can evaluate e.g. "$itlast" = "(64 * 16)".
+jw_par_value() {
+  local v d i
+  v=$(jw_par_get "$1" "$2")
+  for i in 1 2 3 4 5; do
+    [[ $v =~ \$\{?([A-Za-z_][A-Za-z_0-9]*)\}? ]] || break
+    d=$(jw_par_get "$1" "\\\$${BASH_REMATCH[1]}")
+    [ -n "$d" ] || break
+    v=${v//"${BASH_REMATCH[0]}"/($d)}
+  done
+  printf '%s\n' "$v"
 }
 # jw_num <expr>: evaluate a simple numeric expression (digits . e + - * / parentheses); fails if not numeric.
 jw_num() {
@@ -114,12 +137,79 @@ jw_num() {
   awk "BEGIN{printf \"%.17g\", $v}" 2>/dev/null
 }
 
-# ---------------------------------------------------------------- checkpoints
-jw_latest_checkpoint_iter() {
-  ls "$CHECKPOINT_DIR"/*.chkpt.it_*.h5 2>/dev/null |
-    sed -n 's/.*\.it_\([0-9]*\)\..*/\1/p' | sort -n | uniq | tail -n1
+# ---------------------------------------------------------------- drivers / checkpoints
+# Everything that depends on the driver (DRIVER=carpet|carpetx, chosen by `jw setup` from
+# ActiveThorns and frozen in .sim_data/config) lives in this section:
+#   carpet  : CarpetIOHDF5 writes <file>.chkpt.it_<N>[.file_<p>].h5 and announces the
+#             termination checkpoint with
+#             "Dumping termination checkpoint at iteration N, simulation time T"
+#   carpetx : CarpetX writes <file>.chkpt.it<NNNNNNNN>.<bp5|bp4|bp|h5|silo> (zero padded;
+#             openPMD/ADIOS2 BP5 is a directory) plus an index <file>.openpmd.visit, and
+#             announces with "Checkpointing before terminating at iteration N, time T, run time H h".
+#             The announcement precedes the write, so the write must be confirmed separately
+#             (jw_term_write_ok): Cactus must reach its clean shutdown ("Done.") afterwards, or
+#             print a "... skipping checkpointing" line; older CarpetX printed "OutputOpenPMD done.".
+
+# jw_active_thorns <parfile>: the thorn names of every ActiveThorns statement, one per line.
+jw_active_thorns() {
+  awk '
+    !inq && tolower($0) ~ /^[ \t]*activethorns[ \t]*=/ { sub(/^[^=]*=[ \t]*/, ""); sub(/^"/, ""); inq = 1 }
+    inq { if (match($0, /"/)) { print substr($0, 1, RSTART - 1); inq = 0 } else print }
+  ' "$1" | tr -s ' \t' '\n' | grep -v '^$'
 }
-jw_checkpoint_exists() { ls "$CHECKPOINT_DIR"/*.chkpt.it_"$1".* >/dev/null 2>&1; }
+
+# jw_checkpoint_iters: every checkpoint iteration in CHECKPOINT_DIR, ascending, unpadded, unique.
+jw_checkpoint_iters() {
+  local p
+  case $DRIVER in
+    carpetx)
+      for p in "$CHECKPOINT_DIR"/*.chkpt.it[0-9]*.*; do
+        [[ $p =~ \.it0*([0-9]+)\.(bp5|bp4|bp|h5|silo)$ ]] && echo "${BASH_REMATCH[1]}"
+      done ;;
+    *)
+      for p in "$CHECKPOINT_DIR"/*.chkpt.it_[0-9]*.h5; do
+        [[ $p =~ \.it_([0-9]+)\. ]] && echo "${BASH_REMATCH[1]}"
+      done ;;
+  esac | sort -n | uniq
+}
+jw_latest_checkpoint_iter() { jw_checkpoint_iters | tail -n1; }
+jw_checkpoint_exists() {    # <iteration>
+  local i
+  [[ ${1:-} =~ ^[0-9]+$ ]] || return 1
+  for i in $(jw_checkpoint_iters); do [ "$i" -eq "$(( 10#$1 ))" ] && return 0; done
+  return 1
+}
+jw_checkpoint_pattern() { case $DRIVER in carpetx) echo '*.chkpt.it<NNNNNNNN>.<bp5|bp4|bp|h5|silo>' ;; *) echo '*.chkpt.it_<N>.*.h5' ;; esac; }
+
+# jw_term_checkpoint <cactus-output>: prints "<iteration> <time>" of the (last) termination
+# checkpoint announcement; returns 1 when Cactus never announced one.
+jw_term_checkpoint() {
+  local line it t=""
+  case $DRIVER in
+    carpetx) line=$(grep -E 'Checkpointing before terminating at iteration [0-9]+' "$1" | tail -n1) ;;
+    *)       line=$(grep -E 'Dumping termination checkpoint at iteration [0-9]+' "$1" | tail -n1) ;;
+  esac
+  [[ $line =~ at\ iteration\ ([0-9]+) ]] || return 1
+  it=${BASH_REMATCH[1]}
+  [[ $line =~ (simulation\ )?time\ ([-+0-9.eE]+) ]] && t=${BASH_REMATCH[2]}
+  echo "$it $t"
+}
+
+# jw_term_write_ok <cactus-output> <iteration> <checkpoint-method>: for CarpetX, require that
+# the write announced by the termination line was completed. CarpetX prints nothing when a
+# checkpoint is finished, so the evidence is the flesh's clean shutdown line "Done." after the
+# announcement (a job killed inside the write never prints it), a "... skipping checkpointing"
+# line, or "OutputOpenPMD done." from older CarpetX versions. Prints the reason on stdout and
+# returns 1 when unconfirmed; always 0 for Carpet (its line is printed after the write).
+jw_term_write_ok() {
+  local out=$1 it=$2 method=$3 n
+  [ "$DRIVER" = carpetx ] || return 0
+  n=$(grep -nE 'Checkpointing before terminating at iteration ' "$out" | tail -n1 | cut -d: -f1)
+  [ -n "$n" ] || { echo "no announcement found"; return 1; }
+  tail -n +"$(( n + 1 ))" "$out" | grep -qE '^Done\.$|OutputOpenPMD done\.|at iteration '"$it"'; skipping checkpointing' && return 0
+  echo "the write was never confirmed (Cactus never reached its 'Done.' shutdown line after the announcement): it died inside the checkpoint write, the directory on disk is incomplete"
+  return 1
+}
 
 # ---------------------------------------------------------------- Slurm
 # All scheduler commands go through jw_slurm so that a compute node without
@@ -143,7 +233,7 @@ jw_slurm() {                # <cmd> args...
 # jw_sbatch args... -> job id on stdout, nothing on failure.
 jw_sbatch() {
   local out
-  out=$(jw_slurm sbatch --parsable "$@") || return 1
+  out=$(jw_slurm sbatch --parsable --export="$SBATCH_EXPORT" "$@") || return 1
   out=${out%%;*}
   [[ $out =~ ^[0-9]+$ ]] || { jw_warn "sbatch returned unexpected output: $out"; return 1; }
   echo "$out"
@@ -154,8 +244,13 @@ jw_sbatch() {
 jw_job_state() {
   local out
   [ -n "$1" ] || { echo ""; return 0; }
-  out=$(jw_slurm squeue -h -j "$1" -o %T 2>/dev/null) || return 1
-  echo "${out%%$'\n'*}"
+  if out=$(jw_slurm squeue -h -j "$1" -o %T 2>&1); then
+    echo "${out%%$'\n'*}"; return 0
+  fi
+  # After MinJobAge the controller forgets a finished job and squeue -j fails with this message.
+  [[ $out == *"Invalid job id specified"* ]] && { echo ""; return 0; }
+  printf '%s\n' "$out" >&2
+  return 1
 }
 # jw_job_in_queue <jobid>: 0 = still pending/running, 1 = finished or unknown, 2 = query failed.
 jw_job_in_queue() {
@@ -205,15 +300,17 @@ jw_prepare_run() {
     jw_warn "Run$n exists and is not empty"; return 1
   fi
   mkdir -p "$dir" || return 1
-  local RUN=$n MAX_RUNTIME
-  MAX_RUNTIME=$(( $(jw_walltime_minutes "$WALLTIME") - RUNTIME_MARGIN_MIN ))
+  local RUN=$n MAX_RUNTIME WALLTIME_MIN WALLTIME_HOURS
+  WALLTIME_MIN=$(jw_walltime_minutes "$WALLTIME") || return 1
+  MAX_RUNTIME=$(( WALLTIME_MIN - RUNTIME_MARGIN_MIN ))
   (( MAX_RUNTIME > 0 )) || { jw_warn "WALLTIME $WALLTIME minus RUNTIME_MARGIN_MIN $RUNTIME_MARGIN_MIN is not positive"; return 1; }
+  WALLTIME_HOURS=$(awk -v m="$WALLTIME_MIN" 'BEGIN{printf "%g", m / 60}')   # for TerminationTrigger::max_walltime
   local SBATCH_MEM=""
   [ -n "$MEM" ] && SBATCH_MEM="#SBATCH --mem=$MEM"
   jw_fill_template "$sd/sub.template" "$dir/sub" \
       SIMNAME RUN PARTITION WALLTIME NODES TASKS_PER_NODE CPUS_PER_TASK SBATCH_MEM MAIL SLURM_MAIL_TYPE SBATCH_EXTRA || return 1
   jw_fill_template "$sd/parfile.template" "$dir/$PARFILE" \
-      CHECKPOINT_DIR MAX_RUNTIME SIMDIR SIMNAME RUN DATADIRNAME || return 1
+      CHECKPOINT_DIR MAX_RUNTIME WALLTIME_HOURS RUNTIME_MARGIN_MIN SIMDIR SIMNAME RUN DATADIRNAME || return 1
   ln "$sd/$EXE" "$dir/$EXE" 2>/dev/null || cp "$sd/$EXE" "$dir/$EXE" || return 1
   jw_status_set "$dir/status" state=PREPARED created="$(date +%s)"
   echo "$dir"
@@ -227,10 +324,10 @@ jw_remove_unrun_run() {
   st=$(jw_status_get "$dir/status" state)
   case $st in PREPARED|QUEUED|CANCELLED|"") ;; *) return 1 ;; esac
   ls "$dir"/cactus_*.out >/dev/null 2>&1 && return 1
-  for f in sub "$PARFILE" "$EXE" status status.tmp .jobid; do
+  for f in sub "$PARFILE" "$EXE" status .jobid; do
     [ -n "$f" ] && [ -f "$dir/$f" ] && rm -f "$dir/${f:?}"
   done
-  rm -f "$dir"/stdout_*.out
+  rm -f "$dir"/stdout_*.out "$dir"/status.tmp*
   rmdir "$dir" 2>/dev/null || return 1
 }
 jw_clear_prepared() { jw_remove_unrun_run "$1"; }

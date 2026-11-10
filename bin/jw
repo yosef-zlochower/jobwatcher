@@ -50,17 +50,25 @@ ask_required() {            # <prompt> -> value (keeps asking)
 
 # ---------------------------------------------------------------- parfile adaptation
 # Make the template drive checkpointing from JobWatcher: checkpoint/recover dir, max_runtime, terminate mode.
-adapt_parfile() {           # <template-file>
-  local f=$1 v notes=()
+adapt_parfile() {           # <template-file>; sets DRIVER (honours DRIVER_OPT from --driver)
+  local f=$1 v notes=() thorns p
   set_par() {               # <param-regex> <display-name> <value>  (replace last assignment or append)
     local re=$1 name=$2 val=$3
     if grep -qiE "^[[:space:]]*$re[[:space:]]*=" "$f"; then
-      local n; n=$(grep -niE "^[[:space:]]*$re[[:space:]]*=" "$f" | tail -n1 | cut -d: -f1)
-      sed -i "${n}s|^.*\$|$name = $val|" "$f"
+      local n tmp; n=$(grep -niE "^[[:space:]]*$re[[:space:]]*=" "$f" | tail -n1 | cut -d: -f1)
+      tmp=$(mktemp "$f.XXXXXX") || return 1
+      JW_REPL="$name = $val" awk -v n="$n" 'NR==n{print ENVIRON["JW_REPL"]; next}{print}' "$f" > "$tmp" && mv -f "$tmp" "$f"
     else
       printf '\n%s = %s\n' "$name" "$val" >> "$f"
     fi
   }
+  thorns=$(jw_active_thorns "$f")
+  if [ -n "${DRIVER_OPT:-}" ]; then
+    DRIVER=$DRIVER_OPT; notes+=("driver: $DRIVER (--driver)")
+  elif grep -qix carpetx <<<"$thorns"; then DRIVER=carpetx; notes+=("driver: carpetx (CarpetX in ActiveThorns)")
+  elif grep -qix carpet  <<<"$thorns"; then DRIVER=carpet;  notes+=("driver: carpet (Carpet in ActiveThorns)")
+  else DRIVER=carpet; jw_warn "ActiveThorns names neither Carpet nor CarpetX; assuming DRIVER=carpet (override with --driver carpetx)"
+  fi
   grep -q '@REP{CHECKPOINT_DIR}' "$f" || {
     set_par 'IO::checkpoint_dir' 'IO::checkpoint_dir' '"@REP{CHECKPOINT_DIR}"'
     set_par 'IO::recover_dir'    'IO::recover_dir'    '"@REP{CHECKPOINT_DIR}"'
@@ -73,25 +81,26 @@ adapt_parfile() {           # <template-file>
   # Keep an existing final condition (iteration/time) and add the runtime limit: "any".
   # A degenerate condition (cctk_itlast <= 0, cctk_final_time <= 0) is dropped: "runtime".
   v=$(jw_par_get "$f" 'cactus::terminate' | tr 'A-Z' 'a-z'); [ -n "$v" ] || v=iteration   # Cactus default
-  local itlast ftime; itlast=$(jw_num "$(jw_par_get "$f" 'cactus::cctk_itlast')"); ftime=$(jw_num "$(jw_par_get "$f" 'cactus::cctk_final_time')")
+  local itlast ftime; itlast=$(jw_num "$(jw_par_value "$f" 'cactus::cctk_itlast')"); ftime=$(jw_num "$(jw_par_value "$f" 'cactus::cctk_final_time')")
   local it_ok=no t_ok=no
   [ -n "$itlast" ] && awk "BEGIN{exit !($itlast > 0)}" && it_ok=yes
   [ -n "$ftime" ]  && awk "BEGIN{exit !($ftime > 0)}"  && t_ok=yes
   # "any" stops when iteration >= cctk_itlast OR time >= cctk_final_time OR runtime >= max_runtime,
   # and the Cactus defaults (cctk_itlast=10, cctk_final_time=-1) would stop a run at once, so every
-  # condition that is not wanted gets a sentinel that can never be reached.
-  use_any() {
+  # condition that the original mode did not use gets a sentinel that can never be reached
+  # (terminate = "time" ignores cctk_itlast even when the parfile sets it, and vice versa).
+  use_any() {               # <keep iteration condition yes|no> <keep time condition yes|no>
     set_par 'cactus::terminate' 'cactus::terminate' '"any"'
-    [ $it_ok = yes ] || { set_par 'cactus::cctk_itlast' 'cactus::cctk_itlast' '1000000000'; notes+=("cactus::cctk_itlast set to 1000000000 (sentinel: no iteration limit; was ${itlast:-unset})"); }
-    [ $t_ok = yes ]  || { set_par 'cactus::cctk_final_time' 'cactus::cctk_final_time' '1e30'; notes+=("cactus::cctk_final_time set to 1e30 (sentinel: no time limit; was ${ftime:-unset})"); }
+    [ $1 = yes ] || { set_par 'cactus::cctk_itlast' 'cactus::cctk_itlast' '1000000000'; notes+=("cactus::cctk_itlast set to 1000000000 (sentinel: no iteration limit; was ${itlast:-unset})"); }
+    [ $2 = yes ] || { set_par 'cactus::cctk_final_time' 'cactus::cctk_final_time' '1e30'; notes+=("cactus::cctk_final_time set to 1e30 (sentinel: no time limit; was ${ftime:-unset})"); }
   }
   case $v in
     runtime) ;;
-    any|all) if [ $it_ok = yes ] || [ $t_ok = yes ]; then use_any; notes+=("cactus::terminate \"$v\" -> \"any\" with sentinels for unused conditions")
+    any|all) if [ $it_ok = yes ] || [ $t_ok = yes ]; then use_any $it_ok $t_ok; notes+=("cactus::terminate \"$v\" -> \"any\" with sentinels for unused conditions")
              else set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\": was \"$v\" but neither cctk_itlast (${itlast:-unset}) nor cctk_final_time (${ftime:-unset}) is positive"); fi ;;
-    iteration) if [ $it_ok = yes ]; then use_any; notes+=("cactus::terminate \"iteration\" -> \"any\": runs stop at cctk_itlast=$itlast or on max_runtime")
+    iteration) if [ $it_ok = yes ]; then use_any yes no; notes+=("cactus::terminate \"iteration\" -> \"any\": runs stop at cctk_itlast=$itlast or on max_runtime")
                else set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\" (was \"iteration\" with cctk_itlast=${itlast:-unset}); the chain ends only via 'jw stop' or MAX_RUNS"); fi ;;
-    time)      if [ $t_ok = yes ]; then use_any; notes+=("cactus::terminate \"time\" -> \"any\": runs stop at cctk_final_time=$ftime or on max_runtime")
+    time)      if [ $t_ok = yes ]; then use_any no yes; notes+=("cactus::terminate \"time\" -> \"any\": runs stop at cctk_final_time=$ftime or on max_runtime")
                else set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\" (was \"time\" with cctk_final_time=${ftime:-unset})"); fi ;;
     *)         set_par 'cactus::terminate' 'cactus::terminate' '"runtime"'; notes+=("cactus::terminate set to \"runtime\" (was \"$v\")") ;;
   esac
@@ -99,8 +108,27 @@ adapt_parfile() {           # <template-file>
   [ "$v" = autoprobe ] || { set_par 'IO::recover' 'IO::recover' '"autoprobe"'; notes+=("IO::recover set to \"autoprobe\" (was \"${v:-unset}\")"); }
   v=$(jw_par_get "$f" 'IO::checkpoint_on_terminate' | tr 'A-Z' 'a-z')
   [ "$v" = yes ] || { set_par 'IO::checkpoint_on_terminate' 'IO::checkpoint_on_terminate' 'yes'; notes+=("IO::checkpoint_on_terminate set to yes (was \"${v:-unset}\")"); }
-  v=$(jw_par_get "$f" 'CarpetIOHDF5::checkpoint' | tr 'A-Z' 'a-z')
-  [ "$v" = yes ] || { set_par 'CarpetIOHDF5::checkpoint' 'CarpetIOHDF5::checkpoint' '"yes"'; notes+=("CarpetIOHDF5::checkpoint set to \"yes\" (was \"${v:-unset}\")"); }
+  case $DRIVER in
+    carpet)
+      v=$(jw_par_get "$f" 'CarpetIOHDF5::checkpoint' | tr 'A-Z' 'a-z')
+      [ "$v" = yes ] || { set_par 'CarpetIOHDF5::checkpoint' 'CarpetIOHDF5::checkpoint' '"yes"'; notes+=("CarpetIOHDF5::checkpoint set to \"yes\" (was \"${v:-unset}\")"); } ;;
+    carpetx)
+      # The thorn defaults are "error", which aborts the run at the first checkpoint.
+      for p in checkpoint_method recover_method; do
+        v=$(jw_par_get "$f" "CarpetX::$p" | tr 'A-Z' 'a-z')
+        case $v in
+          ''|error) set_par "CarpetX::$p" "CarpetX::$p" '"openpmd"'; notes+=("CarpetX::$p set to \"openpmd\" (was \"${v:-unset}\", which aborts at the first checkpoint)") ;;
+        esac
+      done ;;
+  esac
+  # TerminationTrigger, if active, must agree with cactus::max_runtime instead of carrying a
+  # hard-coded walltime: both placeholders are filled from WALLTIME / RUNTIME_MARGIN_MIN per run.
+  if grep -qix terminationtrigger <<<"$thorns" && ! grep -q '@REP{WALLTIME_HOURS}' "$f"; then
+    local mw rw; mw=$(jw_par_get "$f" 'TerminationTrigger::max_walltime'); rw=$(jw_par_get "$f" 'TerminationTrigger::on_remaining_walltime')
+    set_par 'TerminationTrigger::max_walltime' 'TerminationTrigger::max_walltime' '@REP{WALLTIME_HOURS}'
+    set_par 'TerminationTrigger::on_remaining_walltime' 'TerminationTrigger::on_remaining_walltime' '@REP{RUNTIME_MARGIN_MIN}'
+    notes+=("TerminationTrigger::max_walltime = @REP{WALLTIME_HOURS} (hours, was ${mw:-unset}) and on_remaining_walltime = @REP{RUNTIME_MARGIN_MIN} (was ${rw:-unset}): same trigger time as cactus::max_runtime")
+  fi
   if [ ${#notes[@]} -gt 0 ]; then
     echo "parfile template adjusted:"; printf '  - %s\n' "${notes[@]}"
   fi
@@ -112,10 +140,11 @@ adapt_parfile() {           # <template-file>
 cmd_setup() {
   jw_load_install_config
   ASSUME_YES=no
-  local NAME="" PARTPL="" EXEPATH=""
+  local NAME="" PARTPL="" EXEPATH="" DRIVER_OPT=""
   while [ $# -gt 0 ]; do
     case $1 in
       --name|-N) NAME=$2; shift 2 ;;
+      --driver) DRIVER_OPT=$2; shift 2; [[ $DRIVER_OPT =~ ^(carpet|carpetx)$ ]] || jw_die "--driver must be carpet or carpetx" ;;
       --parfile|-p) PARTPL=$2; shift 2 ;;
       --exe|-e) EXEPATH=$2; shift 2 ;;
       --partition|-q) PARTITION=$2; shift 2 ;;
@@ -197,6 +226,7 @@ EXE=$EXE
 PARFILE=$PARFILE
 DATADIRNAME=$DATADIRNAME
 CHECKPOINT_DIR=$CHECKPOINT_DIR
+DRIVER=$DRIVER
 
 PARTITION=$PARTITION
 WALLTIME=$WALLTIME
@@ -206,7 +236,9 @@ TASKS_PER_NODE=$TASKS_PER_NODE
 CPUS_PER_TASK=$CPUS_PER_TASK
 MEM=$MEM
 SBATCH_EXTRA=$(printf %q "$SBATCH_EXTRA")
+SBATCH_EXPORT=$SBATCH_EXPORT
 
+ENV_INIT=$(printf %q "$ENV_INIT")
 SETUP_SCRIPT=$(printf %q "$SETUP_SCRIPT")
 LAUNCHER=$(printf %q "$LAUNCHER")
 OMP_PROC_BIND=$OMP_PROC_BIND
@@ -230,7 +262,7 @@ EOT
 
 usage_setup() {
   cat <<EOT
-jw setup [--name N] [--parfile FILE] [--exe FILE] [--partition P] [--time W] [--nodes N]
+jw setup [--name N] [--parfile FILE] [--exe FILE] [--driver carpet|carpetx] [--partition P] [--time W] [--nodes N]
          [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE] [--max-runs M] [--queue-depth D]
          [--min-progress I] [--margin MIN] [--hook SCRIPT] [--mail ADDR] [--mail-events LIST]
          [--setup-script FILE] [--launcher CMD] [--strict-checkpoint] [--yes]
@@ -258,9 +290,8 @@ cmd_resume() {
   need_sim
   local depth=$QUEUE_DEPTH
   while [ $# -gt 0 ]; do case $1 in -n) depth=$2; shift 2 ;; *) jw_die "resume: unknown option $1" ;; esac; done
-  rm -f "$SIMDIR/STOP"
   local dir n st job last_ok="" last_ok_job="" ts; ts=$(date +%s)
-  # Anything queued or running must be dealt with first.
+  # Anything queued or running must be dealt with first (STOP stays in place until we know we will resume).
   for dir in $(jw_run_dirs); do
     st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
     case $st in QUEUED|RUNNING)
@@ -278,6 +309,7 @@ cmd_resume() {
       COMPLETE) echo "Run$n reports the simulation COMPLETE; nothing to resume."; return 0 ;;
     esac
   done
+  rm -f "$SIMDIR/STOP"
   for dir in $(jw_run_dirs); do
     n=$(jw_run_index "$dir"); (( n > ${last_ok:-0} )) || continue
     st=$(jw_status_get "$dir/status" state)
@@ -332,7 +364,7 @@ cmd_status() {
   echo "Simulation $SIMNAME in $SIMDIR"
   ck=$(jw_latest_checkpoint_iter)
   echo "  last successful iteration: $(cat "$SIMDIR/.sim_data/last" 2>/dev/null)   newest checkpoint: ${ck:-none}   STOP: $([ -e "$SIMDIR/STOP" ] && echo present || echo no)"
-  echo "  partition=$PARTITION walltime=$WALLTIME nodes=$NODES tasks/node=$TASKS_PER_NODE cpus/task=$CPUS_PER_TASK queue_depth=$QUEUE_DEPTH max_runs=$MAX_RUNS"
+  echo "  driver=$DRIVER partition=$PARTITION walltime=$WALLTIME nodes=$NODES tasks/node=$TASKS_PER_NODE cpus/task=$CPUS_PER_TASK queue_depth=$QUEUE_DEPTH max_runs=$MAX_RUNS"
   printf '  %-7s %-10s %-8s %-10s %-10s %-12s %-9s %s\n' RUN STATE JOB SLURM ITER TIME ELAPSED REASON
   for dir in $(jw_run_dirs); do
     n=$(jw_run_index "$dir"); st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
@@ -354,7 +386,7 @@ cmd_sync() {
   while [ $# -gt 0 ]; do case $1 in --parfile) par=yes; shift ;; *) jw_die "sync: unknown option $1 (only --parfile)" ;; esac; done
   cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$JW_HOME/templates/sub.template" "$SIMDIR/.sim_data/" || jw_die "copy failed"
   jw_log sync - SYNC "library and template updated from $JW_HOME (jw $JW_VERSION)"
-  echo "updated $SIMDIR/.sim_data from $JW_HOME; runs prepared from now on use the new files"
+  echo "updated $SIMDIR/.sim_data from $JW_HOME; every job that starts from now on (including already-queued ones) runs the new jw_job.sh"
   if [ $par = yes ]; then
     cp "$SIMDIR/.sim_data/parfile.template" "$SIMDIR/.sim_data/parfile.template.bak.$(date +%s)"
     adapt_parfile "$SIMDIR/.sim_data/parfile.template"
