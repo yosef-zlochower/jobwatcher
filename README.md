@@ -44,8 +44,8 @@ options < edits to `<simdir>/.sim_data/config`. Existing simulations are self-co
 ## Starting a simulation
 
 ```
-mkdir /lustre/yosef/Runs/q1_new && cd /lustre/yosef/Runs/q1_new
-jw setup --name q1 --parfile ~/pars/q1.par --exe /lustre/yosef/NewCluster/Kruskal/Cactus/exe/cactus_lazev_intel21_base \
+mkdir /scratch/$USER/q1 && cd /scratch/$USER/q1
+jw setup --name q1 --parfile /path/to/q1.par --exe /path/to/Cactus/exe/cactus_sim \
          --partition gp-long --time 2-00:00:00 --nodes 4
 jw start
 ```
@@ -167,8 +167,8 @@ failure.
   delete the output directory after a verified tar), then calls `lazev_combine.sh` if present.
 - `hooks/lazev_combine.sh` rebuilds `<simdir>/combine/` from all successful runs: the LazEv
   diagnostic files, every `*rad_obs_*` file and `pk*` files, concatenated in run order with
-  time overlaps trimmed, then `~/Scripts/pitrack.sh`. It is idempotent, so a resumed chain never
-  duplicates rows.
+  time overlaps trimmed; if `~/Scripts/pitrack.sh` exists it is then run inside `combine/`. It is
+  idempotent, so a resumed chain never duplicates rows.
 
 Enable with `POST_RUN_HOOK=${JW_DIR}/hooks/archive_run.sh` in the config. Hooks run
 inside the job, on the allocated node, after the termination checkpoint; allow for them in
