@@ -37,6 +37,12 @@ the defaults that `jw setup` will offer (partition, walltime, nodes, mail, ...).
 forms: `jw configure --setup-script FILE --partition gp-long`, `jw configure KEY=VALUE`,
 `--unset KEY`, `--show`. The file is plain bash and can be edited by hand.
 
+A post-run hook (a script of your own that runs at the end of every successful run, see Hooks
+below) is configured the same way: `jw configure --hook /path/to/script` makes it the default
+for new simulations, `jw setup --hook` sets it for one, and `POST_RUN_HOOK=/path/to/script` in
+`<simdir>/.sim_data/config` changes it for the runs that follow. `HOOK_FAILURE_FATAL=yes` makes
+a failing hook fail the run.
+
 Configuration precedence: `clusters/gp.conf` < `~/.JobWatcher/config` (`jw configure`) < `jw setup`
 options < edits to `<simdir>/.sim_data/config`. Existing simulations are self-contained: changing
 `~/.JobWatcher/config` affects only simulations set up afterwards.
