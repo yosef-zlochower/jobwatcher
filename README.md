@@ -7,6 +7,7 @@ own outcome (SUCCESS, COMPLETE, FAILED) before exiting. The design and limitatio
 PBS-era scripts it replaces are documented in `~/.JobWatcher/README.md`.
 
 ```
+jw configure [options]   write ~/.JobWatcher/config: environment setup script and personal defaults
 jw setup  [options]      create a simulation in the current directory
 jw start  [-n DEPTH]     create Run1, submit it, keep DEPTH successors queued
 jw status                show every run, its Slurm state and progress
@@ -19,13 +20,21 @@ jw log / jw config       show chain.log / the effective configuration
 ## Install
 
 ```
-~/.JobWatcher/Slurm   -> ~/git/yosef/cluster_scripts/JobWatcher/Slurm   (this directory)
-~/bin/jw              -> ~/.JobWatcher/Slurm/bin/jw                     (~/bin is on PATH)
-~/.JobWatcher/config     user overrides of clusters/gp.conf
+~/.JobWatcher/Slurm   -> <this checkout>              (symlink)
+~/bin/jw              -> ~/.JobWatcher/Slurm/bin/jw   (~/bin is on PATH)
+jw configure                                          once: setup script and personal defaults
 ```
 
-Configuration precedence: `clusters/gp.conf` < `~/.JobWatcher/config` < `jw setup` options
-< edits to `<simdir>/.sim_data/config`.
+`jw configure` writes `~/.JobWatcher/config`. Its one essential entry is `SETUP_SCRIPT`, the
+script every job sources to set up modules/spack before launching Cactus; the cluster config
+deliberately leaves it empty because it is personal. Interactive `jw configure` also asks for
+the defaults that `jw setup` will offer (partition, walltime, nodes, mail, ...). Non-interactive
+forms: `jw configure --setup-script FILE --partition gp-long`, `jw configure KEY=VALUE`,
+`--unset KEY`, `--show`. The file is plain bash and can be edited by hand.
+
+Configuration precedence: `clusters/gp.conf` < `~/.JobWatcher/config` (`jw configure`) < `jw setup`
+options < edits to `<simdir>/.sim_data/config`. Existing simulations are self-contained: changing
+`~/.JobWatcher/config` affects only simulations set up afterwards.
 
 ## Starting a simulation
 

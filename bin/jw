@@ -1,6 +1,7 @@
 #!/bin/bash
 # jw - JobWatcher command line (Slurm edition).
 #
+#   jw configure [options]  write ~/.JobWatcher/config: environment setup script and personal defaults
 #   jw setup  [options]      create a simulation in the current directory
 #   jw start  [-n DEPTH]     create Run1, submit it, and queue DEPTH successors
 #   jw status                show every run, its Slurm state and progress
@@ -11,7 +12,8 @@
 #   jw config                show the effective configuration
 #   jw help
 #
-# Config precedence: clusters/<JW_CLUSTER>.conf < ~/.JobWatcher/config (or $JW_CONFIG) < jw setup options.
+# Config precedence: clusters/<JW_CLUSTER>.conf < ~/.JobWatcher/config (or $JW_CONFIG, written by
+# jw configure) < jw setup options < edits to <simdir>/.sim_data/config.
 
 set -uo pipefail
 
@@ -177,6 +179,9 @@ cmd_setup() {
   [ -r "$PARTPL" ]  || jw_die "cannot read parameter file $PARTPL"
   [ -n "$EXEPATH" ] || EXEPATH=$(ask_required "Cactus executable")
   [ -x "$EXEPATH" ] || jw_die "$EXEPATH is not executable"
+  SETUP_SCRIPT=$(ask "Environment setup script sourced inside the job ('none' = bare login environment)" "${SETUP_SCRIPT:-none}")
+  SETUP_SCRIPT=$(check_setup_script "$SETUP_SCRIPT") || exit 1
+  [ -n "$SETUP_SCRIPT" ] || jw_warn "no SETUP_SCRIPT: the job runs with the bare login environment (set one with 'jw configure --setup-script FILE')"
   PARTITION=$(ask "Partition" "$PARTITION")
   WALLTIME=$(ask "Walltime per run ([D-]HH:MM:SS)" "$WALLTIME")
   NODES=$(ask "Nodes" "$NODES")
@@ -268,7 +273,135 @@ jw setup [--name N] [--parfile FILE] [--exe FILE] [--driver carpet|carpetx] [--p
          [--setup-script FILE] [--launcher CMD] [--strict-checkpoint] [--yes]
 Run it in the (empty) directory that will hold the simulation. Missing values are prompted
 for unless --yes is given, in which case the defaults from the cluster config and
-~/.JobWatcher/config are used.
+~/.JobWatcher/config (written by 'jw configure') are used.
+EOT
+}
+
+# ---------------------------------------------------------------- configure
+# ~/.JobWatcher/config (or $JW_CONFIG) holds the user's own defaults: the environment setup
+# script that every job sources, and whatever cluster defaults the user wants changed for every
+# new simulation.  bash sources it after clusters/<cluster>.conf, so values may use $HOME.
+user_config_file() { echo "${JW_CONFIG:-$HOME/.JobWatcher/config}"; }
+
+config_set() {              # <file> <KEY> <value>: replace the last KEY= line, else append KEY="value"
+  local f=$1 k=$2 v=$3 n tmp
+  v=${v//\\/\\\\}; v=${v//\"/\\\"}
+  if [ -f "$f" ] && grep -q "^$k=" "$f"; then
+    n=$(grep -n "^$k=" "$f" | tail -n1 | cut -d: -f1)
+    tmp=$(mktemp "$f.XXXXXX") || return 1
+    JW_REPL="$k=\"$v\"" awk -v n="$n" 'NR==n{print ENVIRON["JW_REPL"]; next}{print}' "$f" > "$tmp" && mv -f "$tmp" "$f"
+  else
+    printf '%s="%s"\n' "$k" "$v" >> "$f"
+  fi
+}
+config_unset() {            # <file> <KEY>
+  local f=$1 k=$2 tmp
+  [ -f "$f" ] && grep -q "^$k=" "$f" || return 0
+  tmp=$(mktemp "$f.XXXXXX") || return 1
+  grep -v "^$k=" "$f" > "$tmp"; mv -f "$tmp" "$f"
+}
+known_keys() { { grep -ohE '^[A-Z_][A-Z0-9_]*=' "$JW_HOME"/clusters/*.conf | tr -d =; echo DRIVER; } | sort -u; }
+
+# check_setup_script <value> -> absolute path on stdout ("" for none/empty); exit 1 if unreadable
+check_setup_script() {
+  local v=$1
+  case $v in ''|none) echo ""; return 0 ;; esac
+  v=${v/#\~/$HOME}
+  [ -r "$v" ] || { jw_warn "cannot read setup script $v"; return 1; }
+  readlink -f "$v"
+}
+
+cmd_configure() {
+  local f; f=$(user_config_file)
+  local -a sets=() unsets=(); local show=no k v kv known
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --show) show=yes; shift ;;
+      --unset) unsets+=("$2"); shift 2 ;;
+      --setup-script) sets+=("SETUP_SCRIPT=$2"); shift 2 ;;
+      --partition|-q) sets+=("PARTITION=$2"); shift 2 ;;
+      --time|-t) sets+=("WALLTIME=$2"); shift 2 ;;
+      --nodes) sets+=("NODES=$2"); shift 2 ;;
+      --tasks-per-node) sets+=("TASKS_PER_NODE=$2"); shift 2 ;;
+      --cpus-per-task) sets+=("CPUS_PER_TASK=$2"); shift 2 ;;
+      --mem) sets+=("MEM=$2"); shift 2 ;;
+      --max-runs) sets+=("MAX_RUNS=$2"); shift 2 ;;
+      --queue-depth) sets+=("QUEUE_DEPTH=$2"); shift 2 ;;
+      --min-progress) sets+=("MIN_PROGRESS=$2"); shift 2 ;;
+      --margin) sets+=("RUNTIME_MARGIN_MIN=$2"); shift 2 ;;
+      --hook) sets+=("POST_RUN_HOOK=$2"); shift 2 ;;
+      --mail) sets+=("MAIL=$2"); shift 2 ;;
+      --mail-events) sets+=("MAIL_EVENTS=$2"); shift 2 ;;
+      --launcher) sets+=("LAUNCHER=$2"); shift 2 ;;
+      -h|--help) usage_configure; exit 0 ;;
+      [A-Z]*=*) sets+=("$1"); shift ;;
+      *) jw_die "configure: unknown option $1 (try jw configure --help)" ;;
+    esac
+  done
+  if [ $show = yes ]; then
+    echo "# $f"
+    if [ -r "$f" ]; then cat "$f"; else echo "# (does not exist yet: run 'jw configure')"; fi
+    return 0
+  fi
+  if [ ${#sets[@]} -eq 0 ] && [ ${#unsets[@]} -eq 0 ]; then       # interactive: the initial setup
+    jw_load_install_config; ASSUME_YES=no
+    echo "JobWatcher user configuration -> $f"
+    echo "Enter keeps the value in brackets (your current setting, else the cluster default);"
+    echo "'none' clears a path. These become the defaults that 'jw setup' offers."
+    sets+=("SETUP_SCRIPT=$(ask "Environment setup script sourced inside every job (modules/spack)" "${SETUP_SCRIPT:-none}")")
+    sets+=("PARTITION=$(ask "Partition" "$PARTITION")")
+    sets+=("WALLTIME=$(ask "Walltime per run ([D-]HH:MM:SS)" "$WALLTIME")")
+    sets+=("NODES=$(ask "Nodes" "$NODES")")
+    sets+=("TASKS_PER_NODE=$(ask "MPI tasks per node" "$TASKS_PER_NODE")")
+    sets+=("CPUS_PER_TASK=$(ask "OpenMP threads per task" "$CPUS_PER_TASK")")
+    sets+=("MEM=$(ask "Memory per node (--mem, e.g. 16G; 'none' = Slurm default)" "${MEM:-none}")")
+    sets+=("QUEUE_DEPTH=$(ask "Successors to keep queued" "$QUEUE_DEPTH")")
+    sets+=("RUNTIME_MARGIN_MIN=$(ask "Minutes reserved at the end of each run for the termination checkpoint" "$RUNTIME_MARGIN_MIN")")
+    sets+=("MAIL=$(ask "Mail address" "$MAIL")")
+    sets+=("MAIL_EVENTS=$(ask "JobWatcher mails (any of start,success,fail,complete,stopped)" "$MAIL_EVENTS")")
+    sets+=("POST_RUN_HOOK=$(ask "Post-run hook script (see hooks/; 'none' = no hook)" "${POST_RUN_HOOK:-none}")")
+  fi
+  known=$(known_keys)
+  mkdir -p "$(dirname "$f")" || jw_die "cannot create $(dirname "$f")"
+  [ -f "$f" ] || cat > "$f" <<EOT
+# JobWatcher user configuration (created $(date '+%Y-%m-%d') by jw configure).
+# bash sources it after clusters/<cluster>.conf: every value here overrides the cluster default
+# and becomes the default that 'jw setup' offers.  Edit by hand or with 'jw configure KEY=VALUE'.
+EOT
+  for kv in "${sets[@]}"; do
+    k=${kv%%=*}; v=${kv#*=}
+    [[ $k =~ ^[A-Z_][A-Z0-9_]*$ ]] || jw_die "configure: bad key '$k' (expected KEY=VALUE with KEY in capitals)"
+    grep -qx "$k" <<<"$known" || jw_warn "$k is not a key jw uses (see clusters/*.conf); storing it anyway"
+    case $k in
+      SETUP_SCRIPT) v=$(check_setup_script "$v") || exit 1 ;;
+      MEM) [ "$v" = none ] && v="" ;;
+      POST_RUN_HOOK)
+        [ "$v" = none ] && v=""
+        if [ -n "$v" ]; then v=${v/#\~/$HOME}; [ -x "$v" ] || jw_die "POST_RUN_HOOK $v is not an executable file"; v=$(readlink -f "$v"); fi ;;
+      WALLTIME) jw_walltime_minutes "$v" >/dev/null 2>&1 || jw_die "WALLTIME '$v' is not of the form [D-]HH:MM:SS" ;;
+      NODES|TASKS_PER_NODE|CPUS_PER_TASK|MAX_RUNS|QUEUE_DEPTH|MIN_PROGRESS|RUNTIME_MARGIN_MIN)
+        [[ $v =~ ^[0-9]+$ ]] || jw_die "$k must be a non-negative integer (got '$v')" ;;
+    esac
+    config_set "$f" "$k" "$v" || jw_die "cannot write $f"
+    echo "  $k=\"$v\""
+  done
+  for k in "${unsets[@]}"; do config_unset "$f" "$k" || jw_die "cannot write $f"; echo "  $k removed"; done
+  echo "written to $f"
+  jw_load_install_config
+  [ -n "$SETUP_SCRIPT" ] || jw_warn "no SETUP_SCRIPT is configured: jobs will run with the bare login environment"
+}
+
+usage_configure() {
+  cat <<EOT
+jw configure                          interactive: asks for the setup script and the defaults jw setup offers
+jw configure --setup-script FILE      script sourced inside every job to set up modules/spack ('none' = no script)
+jw configure [--partition P] [--time W] [--nodes N] [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE]
+             [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
+             [--mail ADDR] [--mail-events LIST] [--launcher CMD] [KEY=VALUE ...] [--unset KEY ...]
+jw configure --show                   print the file
+Writes $(user_config_file) (override the location with \$JW_CONFIG). Values there override
+clusters/<cluster>.conf and are the defaults jw setup offers; every KEY from the cluster config
+can be set.  Existing simulations are not changed (their .sim_data/config is self-contained).
 EOT
 }
 
@@ -394,9 +527,10 @@ cmd_sync() {
   fi
 }
 
-usage() { sed -n '2,15p' "$JW_BIN" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "$JW_BIN" | sed 's/^# \{0,1\}//'; }
 
 case ${1:-help} in
+  configure) shift; cmd_configure "$@" ;;
   setup)  shift; cmd_setup "$@" ;;
   start)  shift; cmd_start "$@" ;;
   resume) shift; cmd_resume "$@" ;;

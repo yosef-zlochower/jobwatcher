@@ -59,6 +59,26 @@ printf '$itlast = 64 * 16\n$final_time = 1000\nCactus::cctk_itlast = $itlast\nCa
 check "job exports the environment to srun tasks despite --export=NONE" 'grep -q "^export SLURM_EXPORT_ENV=ALL" "$JW_HOME/lib/jw_job.sh"'
 check "par_value resolves parfile variables" '[ "$(jw_num "$(jw_par_value "$T/par1" cactus::cctk_itlast)")" = 1024 ] && [ "$(jw_num "$(jw_par_value "$T/par1" cactus::cctk_final_time)")" = 1000 ]'
 
+echo "== configure: the user config file (setup script and personal defaults)"
+UC=$T/cfg/config; printf '#!/bin/bash\nexport FROM_SETUP_SCRIPT=1\n' > "$T/setup.sh"
+check "configure creates the file with the setup script and a default" \
+  'JW_CONFIG=$UC "$JW" configure --setup-script "$T/setup.sh" --partition gp-long > "$T/cfg1.log" 2>&1 && grep -q "^SETUP_SCRIPT=\"$T/setup.sh\"$" "$UC" && grep -q "^PARTITION=\"gp-long\"$" "$UC"'
+check "KEY=VALUE replaces the key in place (one line, last value wins)" \
+  'JW_CONFIG=$UC "$JW" configure PARTITION=debug > /dev/null 2>&1 && [ "$(grep -c "^PARTITION=" "$UC")" = 1 ] && grep -q "^PARTITION=\"debug\"$" "$UC"'
+check "a missing setup script is refused and the file is left alone" \
+  '! JW_CONFIG=$UC "$JW" configure --setup-script "$T/nope.sh" > /dev/null 2>&1 && grep -q "^SETUP_SCRIPT=\"$T/setup.sh\"$" "$UC"'
+check "a bad walltime and a non-integer node count are refused" \
+  '! JW_CONFIG=$UC "$JW" configure --time "two days" > /dev/null 2>&1 && ! JW_CONFIG=$UC "$JW" configure --nodes many > /dev/null 2>&1 && ! grep -q "^WALLTIME=\|^NODES=" "$UC"'
+check "--unset removes a key, --show prints the file" \
+  'JW_CONFIG=$UC "$JW" configure --unset PARTITION > /dev/null 2>&1 && ! grep -q "^PARTITION=" "$UC" && JW_CONFIG=$UC "$JW" configure --show | grep -q "^SETUP_SCRIPT="'
+check "an unknown key is stored with a warning" \
+  'JW_CONFIG=$UC "$JW" configure MYKEY=1 > "$T/cfg2.log" 2>&1 && grep -q "^MYKEY=\"1\"$" "$UC" && grep -q "not a key" "$T/cfg2.log"'
+mkdir -p "$T/cfgsim"; mkpar "$T/cfgsim/p.par" 100
+check "jw setup --yes takes the configured setup script" \
+  '( cd "$T/cfgsim" && JW_CONFIG=$UC "$JW" setup --yes --name cfg --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "^SETUP_SCRIPT=$T/setup.sh$" "$T/cfgsim/.sim_data/config"'
+check "jw setup warns when no setup script is configured" \
+  'mkdir -p "$T/cfgsim2" && mkpar "$T/cfgsim2/p.par" 100 && ( cd "$T/cfgsim2" && "$JW" setup --yes --name cfg2 --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "no SETUP_SCRIPT" "$T/cfgsim2/setup.log" && grep -q "^SETUP_SCRIPT=..$" "$T/cfgsim2/.sim_data/config"'
+
 echo "== scenario A: chain runs to completion (cctk_itlast reached) and cancels the queued successor"
 A=$T/simA; mkdir -p "$A"; mkpar "$T/bbh.par" 1700
 ( cd "$A" && "$JW" setup --yes --name simA --parfile "$T/bbh.par" --exe "$JW_HOME/tests/fakecactus" --max-runs 20 --mem 4G > setup.log 2>&1 ) || { fail "setup A"; cat "$A/setup.log"; }
