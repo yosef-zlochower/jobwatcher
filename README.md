@@ -19,12 +19,18 @@ jw log / jw config       show chain.log / the effective configuration
 
 ## Install
 
+Choose a directory for JobWatcher (any directory: `jw` finds its library relative to its own
+resolved location), clone the repository there and put `jw` on your PATH:
+
 ```
-~/repo/jobwatcher                                     clone of github.com/yosef-zlochower/jobwatcher
-~/.JobWatcher/Slurm   -> ~/repo/jobwatcher            (symlink)
-~/bin/jw              -> ~/.JobWatcher/Slurm/bin/jw   (~/bin is on PATH)
-jw configure                                          once: setup script and personal defaults
+export JW_DIR=~/jobwatcher
+git clone https://github.com/yosef-zlochower/jobwatcher ${JW_DIR}
+ln -s ${JW_DIR}/bin/jw ~/bin/
+jw configure                 # once: environment setup script and personal defaults
 ```
+
+The repository root is the Slurm edition itself (`bin/jw`, `lib/`, `clusters/`, `hooks/`, ...).
+The only fixed path is the user configuration, `~/.JobWatcher/config` (override with `$JW_CONFIG`).
 
 `jw configure` writes `~/.JobWatcher/config`. Its one essential entry is `SETUP_SCRIPT`, the
 script every job sources to set up modules/spack before launching Cactus; the cluster config
@@ -166,7 +172,7 @@ failure.
   time overlaps trimmed, then `~/Scripts/pitrack.sh`. It is idempotent, so a resumed chain never
   duplicates rows (the old `combo.sh`/`olderdata` dance is gone).
 
-Enable with `POST_RUN_HOOK=$HOME/.JobWatcher/Slurm/hooks/archive_run.sh` in the config. Hooks run
+Enable with `POST_RUN_HOOK=${JW_DIR}/hooks/archive_run.sh` in the config. Hooks run
 inside the job, on the allocated node, after the termination checkpoint; allow for them in
 `RUNTIME_MARGIN_MIN`.
 
