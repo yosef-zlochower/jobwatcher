@@ -359,7 +359,7 @@ cmd_configure() {
     sets+=("RUNTIME_MARGIN_MIN=$(ask "Minutes reserved at the end of each run for the termination checkpoint" "$RUNTIME_MARGIN_MIN")")
     sets+=("MAIL=$(ask "Mail address" "$MAIL")")
     sets+=("MAIL_EVENTS=$(ask "JobWatcher mails (any of start,success,fail,complete,stopped)" "$MAIL_EVENTS")")
-    sets+=("POST_RUN_HOOK=$(ask "Post-run hook script (see hooks/; 'none' = no hook)" "${POST_RUN_HOOK:-none}")")
+    sets+=("POST_RUN_HOOK=$(ask "Post-run hook script ('none' = no hook)" "${POST_RUN_HOOK:-none}")")
   fi
   known=$(known_keys)
   mkdir -p "$(dirname "$f")" || jw_die "cannot create $(dirname "$f")"

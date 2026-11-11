@@ -120,7 +120,7 @@ States: `PREPARED → QUEUED → RUNNING → SUCCESS | COMPLETE | FAILED | STOPP
    also exits 1 so Slurm's `afterok` can never fire. Slurm's own `--mail-type=FAIL` mail plus
    JobWatcher's summary mail (events chosen by `MAIL_EVENTS`, with the tail of the Cactus
    output on failure) are sent.
-7. Runs `POST_RUN_HOOK <rundir> <state>` if set (see hooks/).
+7. Runs `POST_RUN_HOOK <rundir> <state>` if set (see Hooks below).
 
 Because the successor is queued at the *start* of a run it accrues queue priority while the
 run executes; if the run is killed by the time limit or a node failure, its exit status is
@@ -162,17 +162,21 @@ failure.
 
 ## Hooks
 
-- `hooks/archive_run.sh` tars `RunN/<DATADIRNAME>` plus the parfile, status and Cactus output
-  into `<simdir>/Archive/<DATADIRNAME>_RunN.tar.gz` (set `JW_ARCHIVE_REMOVE=yes` in `EXTRA_ENV` to
-  delete the output directory after a verified tar), then calls `lazev_combine.sh` if present.
-- `hooks/lazev_combine.sh` rebuilds `<simdir>/combine/` from all successful runs: the LazEv
-  diagnostic files, every `*rad_obs_*` file and `pk*` files, concatenated in run order with
-  time overlaps trimmed; if `~/Scripts/pitrack.sh` exists it is then run inside `combine/`. It is
-  idempotent, so a resumed chain never duplicates rows.
+`POST_RUN_HOOK` names a script of your own (archiving, merging diagnostics, ...) that every
+successful run executes at its end. Set it with `jw configure --hook SCRIPT`, `jw setup --hook`,
+or `POST_RUN_HOOK=/path/to/script` in a config. The interface:
 
-Enable with `POST_RUN_HOOK=${JW_DIR}/hooks/archive_run.sh` in the config. Hooks run
-inside the job, on the allocated node, after the termination checkpoint; allow for them in
-`RUNTIME_MARGIN_MIN`.
+- Called as `SCRIPT <rundir> <state>` with `state` `SUCCESS` or `COMPLETE`, inside the job on the
+  allocated node, after the termination checkpoint, with the job's environment. Allow for its
+  running time in `RUNTIME_MARGIN_MIN`.
+- Must be executable; otherwise it is skipped with a warning.
+- Its output goes to `RunN/hook_<jobid>.out`.
+- A non-zero exit is logged as `HOOK-FAIL` in `chain.log`; the run itself stays `SUCCESS` unless
+  `HOOK_FAILURE_FATAL=yes`.
+- To get at the simulation's settings (`DATADIRNAME`, `PARFILE`, `CHECKPOINT_DIR`, ...) source
+  `<simdir>/.sim_data/jw_common.sh` and call `jw_load_sim <simdir>`, where `<simdir>` is the
+  parent of `<rundir>`; `jw_run_dirs` then lists the run directories in order and
+  `jw_status_get <dir>/status state` tells which of them succeeded.
 
 ## Cluster assumptions (green-prairies, Slurm 23.11)
 
