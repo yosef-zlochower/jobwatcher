@@ -1,10 +1,9 @@
-# JobWatcher (Slurm edition) — chained Cactus runs on green-prairies
+# JobWatcher — chained Cactus runs under Slurm on green-prairies
 
 `jw` runs one Cactus simulation as a chain of Slurm jobs. Each job recovers from the
 checkpoint written by its predecessor, verifies that the predecessor really succeeded,
 keeps a successor queued behind itself with `--dependency=afterok`, and classifies its
-own outcome (SUCCESS, COMPLETE, FAILED) before exiting. The design and limitations of the
-PBS-era scripts it replaces are documented in `~/.JobWatcher/README.md`.
+own outcome (SUCCESS, COMPLETE, FAILED) before exiting.
 
 ```
 jw configure [options]   write ~/.JobWatcher/config: environment setup script and personal defaults
@@ -29,7 +28,6 @@ ln -s ${JW_DIR}/bin/jw ~/bin/
 jw configure                 # once: environment setup script and personal defaults
 ```
 
-The repository root is the Slurm edition itself (`bin/jw`, `lib/`, `clusters/`, `hooks/`, ...).
 The only fixed path is the user configuration, `~/.JobWatcher/config` (override with `$JW_CONFIG`).
 
 `jw configure` writes `~/.JobWatcher/config`. Its one essential entry is `SETUP_SCRIPT`, the
@@ -170,7 +168,7 @@ failure.
 - `hooks/lazev_combine.sh` rebuilds `<simdir>/combine/` from all successful runs: the LazEv
   diagnostic files, every `*rad_obs_*` file and `pk*` files, concatenated in run order with
   time overlaps trimmed, then `~/Scripts/pitrack.sh`. It is idempotent, so a resumed chain never
-  duplicates rows (the old `combo.sh`/`olderdata` dance is gone).
+  duplicates rows.
 
 Enable with `POST_RUN_HOOK=${JW_DIR}/hooks/archive_run.sh` in the config. Hooks run
 inside the job, on the allocated node, after the termination checkpoint; allow for them in
@@ -184,9 +182,8 @@ inside the job, on the allocated node, after the termination checkpoint; allow f
   and keep `TASKS_PER_NODE * CPUS_PER_TASK` within what is free. Use `debug` for short tests.
 - Slurm accounting is disabled, so `sacct` cannot tell whether a job succeeded; JobWatcher
   relies on its own status files and on `afterok`.
-- Verified on 2026-11-04 with a probe job on `lm-n0001`: `sbatch`, `squeue`, `scontrol` and
-  `scancel` work on compute nodes, and a job submitted from inside a job with
-  `--dependency=afterok` runs. There is **no `mail` command on compute nodes**, so JobWatcher's
+- `sbatch`, `squeue`, `scontrol` and `scancel` work on compute nodes, and a job submitted from
+  inside a job with `--dependency=afterok` runs. There is **no `mail` command on compute nodes**, so JobWatcher's
   summary mails go through `ssh $MASTERNODE mail ...` (passwordless ssh from the nodes to
   green-prairies works). Slurm's own `--mail-type` mails are sent by the controller and need
   nothing from the node. Every scheduler call also has the same ssh fallback.
@@ -195,9 +192,8 @@ inside the job, on the allocated node, after the termination checkpoint; allow f
   predecessor is gone.
 - Jobs are submitted with `--export=NONE` (`SBATCH_EXPORT`), so Slurm gives every job a fresh
   login environment instead of a copy of the submitter's; a successor submitted from inside a
-  running job therefore sees exactly what a job submitted from the login node sees (verified
-  2026-11-10 with probe jobs: identical environments, nothing inherited from the parent job). The
-  job then evaluates `ENV_INIT` (defines `module`, since `/etc/profile.d/lmod.sh` is a no-op under
+  running job therefore sees exactly what a job submitted from the login node sees, nothing is
+  inherited from the parent job. The job then evaluates `ENV_INIT` (defines `module`, since `/etc/profile.d/lmod.sh` is a no-op under
   Slurm), sources `SETUP_SCRIPT` and sets `SLURM_EXPORT_ENV=ALL` so that `srun` passes that
   environment to the Cactus tasks (with `NONE` still in force the tasks would start without
   `HOME`/`PATH` and OpenMPI's `MPI_Init` fails with "Unable to get the user home directory").
@@ -212,4 +208,4 @@ walltime parsing, templating and parfile-variable resolution; a chain that compl
 announced-but-missing checkpoint file; `jw resume` refusing while a job is queued; jobs forgotten
 by the controller after `MinJobAge`; and a CarpetX chain (`FAKE_DRIVER=carpetx`: padded `.bp5`
 directories, completion by `cctk_final_time` given as a parfile variable, a write killed before
-`OutputOpenPMD done.`, the "Already wrote"/"Recovered from" skip lines).
+the clean shutdown, the "Already wrote"/"Recovered from" skip lines); and `jw configure`.
