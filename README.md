@@ -20,7 +20,8 @@ jw log / jw config       show chain.log / the effective configuration
 ## Install
 
 ```
-~/.JobWatcher/Slurm   -> <this checkout>              (symlink)
+~/repo/jobwatcher                                     clone of github.com/yosef-zlochower/jobwatcher
+~/.JobWatcher/Slurm   -> ~/repo/jobwatcher            (symlink)
 ~/bin/jw              -> ~/.JobWatcher/Slurm/bin/jw   (~/bin is on PATH)
 jw configure                                          once: setup script and personal defaults
 ```
