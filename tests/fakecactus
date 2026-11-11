@@ -1,0 +1,80 @@
+#!/bin/bash
+# fakecactus - imitates the parts of Cactus that jw_job.sh relies on.
+#   - reads IO::recover_dir, cactus::cctk_itlast, cactus::max_runtime and IO::out_dir from the parfile
+#   - "recovers" from the newest checkpoint in the recover dir
+#   - advances FAKE_STEP iterations (default 500), capped at cctk_itlast
+#   - writes checkpoint.chkpt.it_<N>.file_0.h5 and prints the CarpetIOHDF5 termination lines
+# Environment knobs: FAKE_CRASH=1 (exit 1, no termination checkpoint), FAKE_STEP=<n>,
+#                    FAKE_NOCHECKPOINT=1 (print the line but write no file).
+# FAKE_DRIVER=carpetx imitates CarpetX instead: checkpoints are directories
+#   checkpoint.chkpt.it<NNNNNNNN>.bp5, the termination line is "Checkpointing before terminating
+#   at iteration N, time T, run time H h" followed by the writer's lines and, as the only proof of
+#   completion, the flesh's final "Done." (omitted with FAKE_NODONE=1: died inside the write), or
+#   "Already wrote checkpoint at iteration N; skipping checkpointing" (FAKE_ALREADY=1: a periodic
+#   checkpoint coincided).
+par=${1:?parfile}
+getp() { local v; v=$(grep -iE "^[[:space:]]*$1[[:space:]]*=" "$par" | tail -n1 | sed -e 's/#.*//' -e 's/^[^=]*=[[:space:]]*//' -e 's/"//g' -e 's/[[:space:]]*$//')
+         case $v in '$parfile'|'') ;; \$*) v=$(getp "\\$v") ;; esac; printf '%s\n' "$v"; }
+ckdir=$(getp 'IO::recover_dir'); itlast=$(getp 'cactus::cctk_itlast'); maxrt=$(getp 'cactus::max_runtime')
+outdir=$(getp 'IO::out_dir'); [ "$outdir" = '$parfile' ] && outdir=${par%.par}
+mkdir -p "$outdir"
+cat <<EOT
+--------------------------------------------------------------------------------
+       10
+  1   0101       ************************
+  01  1010 10      The Cactus Code V4.18.0
+ 1010 1101 011      www.cactuscode.org
+--------------------------------------------------------------------------------
+Parameter file:    $par
+INFO (Cactus): max_runtime = $maxrt minutes, cctk_itlast = ${itlast:-unset}
+EOT
+drv=${FAKE_DRIVER:-carpet}
+if [ "$drv" = carpetx ]; then
+  last=$(ls -d "$ckdir"/*.chkpt.it[0-9]*.bp5 2>/dev/null | sed -n 's/.*\.it0*\([0-9][0-9]*\)\.bp5$/\1/p' | sort -n | tail -n1)
+  if [ -n "$last" ]; then echo "INFO (CarpetX): Recovering from checkpoint at iteration $last"; else last=0; fi
+else
+  last=$(ls "$ckdir"/*.chkpt.it_*.h5 2>/dev/null | sed -n 's/.*\.it_\([0-9]*\)\..*/\1/p' | sort -n | tail -n1)
+  if [ -n "$last" ]; then echo "INFO (CarpetIOHDF5): recovering from checkpoint at iteration $last"; else last=0; fi
+fi
+step=${FAKE_STEP:-500}
+new=$(( last + step ))
+# Cactus termination semantics (defaults: terminate=iteration, cctk_itlast=10, cctk_final_time=-1).
+mode=$(getp 'cactus::terminate' | tr 'A-Z' 'a-z'); mode=${mode:-iteration}
+itlast=${itlast:-10}; ftime=$(getp 'cactus::cctk_final_time'); ftime=${ftime:--1}
+stop_at_time() { awk -v l="$last" -v f="$ftime" 'BEGIN{exit !(l*0.000678 >= f)}'; }
+case $mode in
+  iteration) (( new > itlast )) && new=$itlast; (( last >= itlast )) && new=$last ;;
+  time)      stop_at_time && new=$last ;;
+  any)       (( new > itlast )) && new=$itlast; (( last >= itlast )) && new=$last; stop_at_time && new=$last ;;
+esac
+for (( i = last + 1; i <= new; i += 100 )); do echo "Done with this timestep"; echo "it=$i" >> "$outdir/iterations.asc"; done
+case " ${FAKE_CRASH_DIRS:-} " in *" $(basename "$PWD") "*) FAKE_CRASH=1 ;; esac
+if [ "${FAKE_CRASH:-0}" = 1 ]; then
+  echo "Rank 1 with PID 4242 received signal 11"; echo "Writing backtrace to $outdir/backtrace.1.txt"; exit 1
+fi
+t=$(awk "BEGIN{printf \"%g\", $new * 0.000678}")
+if [ "$drv" = carpetx ]; then
+  echo "INFO (CarpetX): Checkpointing before terminating at iteration $new, time $t, run time 0.93 h"
+  if (( new == last )); then
+    echo "INFO (CarpetX): Recovered from checkpoint at iteration $new; skipping checkpointing"
+  elif [ "${FAKE_ALREADY:-0}" = 1 ]; then
+    mkdir -p "$ckdir/checkpoint.chkpt.it$(printf %08d "$new").bp5"; touch "$ckdir/checkpoint.chkpt.it$(printf %08d "$new").bp5/md.0"
+    echo "INFO (CarpetX): Already wrote checkpoint at iteration $new; skipping checkpointing"
+  else
+    echo "INFO (CarpetX): Writing openPMD checkpoint \"$ckdir/checkpoint.chkpt.it%08T.bp5\" iteration $new..."
+    echo "INFO (CarpetX): Performing all writes..."
+    if [ "${FAKE_NOCHECKPOINT:-0}" != 1 ]; then
+      mkdir -p "$ckdir/checkpoint.chkpt.it$(printf %08d "$new").bp5"; touch "$ckdir/checkpoint.chkpt.it$(printf %08d "$new").bp5/md.0"
+      touch "$ckdir/checkpoint.chkpt.openpmd.visit"
+    fi
+    [ "${FAKE_NODONE:-0}" = 1 ] && { echo "srun: error: node: task 3: Killed"; exit 0; }   # rc 0 so the write-confirmation check (not the rc check) decides
+  fi
+else
+  echo "INFO (CarpetIOHDF5): Dumping termination checkpoint at iteration $new, simulation time $t"
+  echo "INFO (CarpetIOHDF5): ---------------------------------------------------------"
+  [ "${FAKE_NOCHECKPOINT:-0}" = 1 ] || touch "$ckdir/checkpoint.chkpt.it_$new.file_0.h5"
+fi
+echo "INFO (TimerReport): Timer Report before terminating at iteration $new time $t"
+echo "--------------------------------------------------------------------------------"
+echo "Done."
+exit 0
