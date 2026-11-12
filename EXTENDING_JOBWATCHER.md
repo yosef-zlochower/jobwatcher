@@ -53,7 +53,7 @@ scheduler's spelling; `*_RAW` are the canonical values. `jw_fill_template` warns
 placeholders a template uses that were not offered.
 
 Generic config keys the chain code reads: `SCHEDULER PARTITION WALLTIME NODES TASKS_PER_NODE
-CPUS_PER_TASK CORES_PER_NODE MEM ACCOUNT QOS EXCLUSIVE MAIL MAIL_TYPE (Slurm vocabulary:
+CPUS_PER_TASK MEM ACCOUNT QOS EXCLUSIVE MAIL MAIL_TYPE (Slurm vocabulary:
 NONE BEGIN END FAIL ALL) MAIL_EVENTS HEADER_EXTRA LAUNCHER SETUP_SCRIPT ENV_INIT EXTRA_ENV
 MASTERNODE`. `bin/jw` writes `SBATCH_EXPORT` into every simulation config today; a new backend
 ignores it, and `write_config` can grow the new backend's knobs the same way.

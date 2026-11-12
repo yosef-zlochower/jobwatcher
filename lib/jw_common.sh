@@ -17,7 +17,6 @@ jw_apply_defaults() {
   : "${SCHEDULER:=slurm}" "${PARTITIONS:=}"
   : "${PARTITION:=}" "${WALLTIME:=24:00:00}" "${NODES:=1}"
   : "${TASKS_PER_NODE:=1}" "${CPUS_PER_TASK:=1}" "${MEM:=}" "${ACCOUNT:=}" "${QOS:=}" "${EXCLUSIVE:=no}"
-  : "${CORES_PER_NODE:=$(( TASKS_PER_NODE * CPUS_PER_TASK ))}"
   : "${SETUP_SCRIPT:=}"
   : "${OMP_PROC_BIND:=close}" "${OMP_PLACES:=cores}" "${EXTRA_ENV:=}" "${HEADER_EXTRA:=}"
   : "${MAIL:=$USER}" "${MAIL_TYPE:=FAIL}" "${MAIL_EVENTS:=fail,complete}"
@@ -30,14 +29,16 @@ jw_apply_defaults() {
 
 # ---------------------------------------------------------------- partitions
 # PARTITIONS (cluster config) describes the partitions, one per line:
-#   name  cores  node_mem  default_mem  max_walltime     ('-' = unknown / no default; '#' comments)
+#   name  cores  tasks  cpus  node_mem  default_mem  max_walltime    ('-' = unknown / no default; '#' comments)
+# cores: cores per node; tasks/cpus: default MPI tasks per node and threads per task; default_mem: the MEM
+# to request unless the user sets one. jw setup takes its defaults from the chosen partition's line.
 # jw_partition_field <partition> <field>: prints the value ('' for '-'); rc 1 when the partition is not listed.
 jw_partition_field() {
-  local n c nm dm w v
-  while read -r n c nm dm w _; do
+  local n c t cp nm dm w v
+  while read -r n c t cp nm dm w _; do
     case $n in ''|'#'*) continue ;; esac
     [ "$n" = "$1" ] || continue
-    case $2 in cores) v=$c ;; node_mem) v=$nm ;; default_mem) v=$dm ;; max_walltime) v=$w ;; *) v="" ;; esac
+    case $2 in cores) v=$c ;; tasks) v=$t ;; cpus) v=$cp ;; node_mem) v=$nm ;; default_mem) v=$dm ;; max_walltime) v=$w ;; *) v="" ;; esac
     case $v in -|'#'*) v="" ;; esac
     echo "$v"; return 0
   done <<<"$PARTITIONS"

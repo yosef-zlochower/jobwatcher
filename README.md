@@ -47,12 +47,13 @@ a failing hook fail the run.
 Cluster-wide defaults (partitions, cores per node, launcher, `ENV_INIT`, ...) live in
 `clusters/<cluster>.conf`. The file shipped in `clusters/` is used as long as it is the only one
 there and is the model for adding another cluster; `JW_CLUSTER=<name>` (or a path to a file)
-selects one explicitly. Its `PARTITIONS` table describes each partition (cores per node, node
-memory, the memory to request by default, walltime limit); `jw setup` takes the core count and
-the memory default from the line of the partition you choose, warns when the walltime exceeds
-the partition's limit or when tasks times threads do not fill a node, and falls back to
-`CORES_PER_NODE` for partitions that are not listed. `--cores-per-node` and `--mem` override
-the table for one simulation.
+selects one explicitly. Its `PARTITIONS` table describes each partition: cores per node, the
+default MPI tasks per node and OpenMP threads per task, node memory, the memory to request by
+default, and the walltime limit. `jw setup` takes tasks, threads and memory from the line of
+the partition you choose, warns when the walltime exceeds the partition's limit or when tasks
+times threads exceed a node, and notes when they use only part of one. `--tasks-per-node`,
+`--cpus-per-task` and `--mem` override the table for one simulation; the same keys in the user
+config override it for every partition.
 
 The batch script is rendered from `templates/<scheduler>/sub.template` (`SCHEDULER` in the
 cluster config, `slurm` today), or from `clusters/<cluster>.sub.template` when a cluster ships
