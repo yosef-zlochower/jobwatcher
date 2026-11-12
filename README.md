@@ -69,8 +69,10 @@ spelled is the scheduler backend's business (`lib/sched/<scheduler>.sh`; see
 `docs/scheduler-backends.md` for the backend contract and how to add another scheduler).
 
 Configuration precedence: `clusters/<cluster>.conf` < `~/.config/jobwatcher/config` (`jw configure`)
-< `jw setup` options < edits to `<simdir>/.sim_data/config`. Existing simulations are
-self-contained: changing the user config affects only simulations set up afterwards.
+< the chosen partition's line in `PARTITIONS` (tasks per node, threads per task and memory,
+unless the user config or an option sets them) < `jw setup` options < edits to
+`<simdir>/.sim_data/config`. Existing simulations are self-contained: changing the user config
+affects only simulations set up afterwards.
 
 ## Starting a simulation
 

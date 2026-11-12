@@ -1,10 +1,12 @@
 # Supporting other batch schedulers: design
 
-Status: proposal (2026-11-12). JobWatcher is Slurm-only today. This document describes how to
-put the scheduler behind a small backend interface so that PBS Pro/OpenPBS, Torque and LSF can
-be added without touching the chain logic, and what each of those schedulers does differently.
+Status: design written 2026-11-12; stage 1 (section 6) is implemented, so Slurm now sits behind
+the backend interface of section 3 in `lib/sched/slurm.sh`. Stages 2 and 3 (PBS Pro/OpenPBS,
+Torque, LSF) are open; EXTENDING_JOBWATCHER.md is the hand-over for them. This document
+describes the interface, what each scheduler does differently, and the test-harness plan.
+Section 1 records where Slurm was baked in before stage 1 and is kept for the history.
 
-## 1. Where Slurm is baked in today
+## 1. Where Slurm was baked in before stage 1
 
 Everything scheduler-specific is confined to a few places; the Cactus side (parfile adaptation,
 checkpoint detection, outcome classification, status files, hooks) is already neutral.

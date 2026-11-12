@@ -14,7 +14,8 @@
 #
 # Config precedence: clusters/<JW_CLUSTER>.conf < the user config (written by jw configure:
 # $JW_CONFIG, else $XDG_CONFIG_HOME/jobwatcher/config, else ~/.config/jobwatcher/config)
-# < jw setup options < edits to <simdir>/.sim_data/config.
+# < the partition's line in PARTITIONS (tasks, threads, memory) < jw setup options
+# < edits to <simdir>/.sim_data/config.
 
 set -uo pipefail
 
@@ -620,7 +621,7 @@ cmd_sync() {
   fi
 }
 
-usage() { sed -n '2,17p' "$JW_BIN" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$JW_BIN" | sed 's/^# \{0,1\}//'; }
 
 case ${1:-help} in
   configure) shift; cmd_configure "$@" ;;
