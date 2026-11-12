@@ -70,6 +70,29 @@ install_sim_files() {
   echo "$tpl"
 }
 
+# partition_defaults <mem-given> <cores-given>: take CORES_PER_NODE and the default MEM for
+# $PARTITION from the cluster config's PARTITIONS table (values given explicitly win).
+partition_defaults() {
+  local v
+  [ -n "$PARTITION" ] && [ -n "$(jw_partition_names)" ] || return 0
+  if ! jw_partition_field "$PARTITION" cores >/dev/null; then
+    jw_warn "partition $PARTITION is not in the cluster config's PARTITIONS table ($(jw_partition_names)); assuming CORES_PER_NODE=$CORES_PER_NODE"
+    return 0
+  fi
+  [ "$2" = yes ] || { v=$(jw_partition_field "$PARTITION" cores); [ -n "$v" ] && CORES_PER_NODE=$v; }
+  [ "$1" = yes ] || [ -n "$MEM" ] || MEM=$(jw_partition_field "$PARTITION" default_mem)
+  return 0
+}
+# partition_checks: warnings about the chosen partition, walltime and node layout.
+partition_checks() {
+  local v
+  if [ -n "$PARTITION" ] && v=$(jw_partition_field "$PARTITION" max_walltime) && [ -n "$v" ] &&
+     (( $(jw_walltime_minutes "$WALLTIME") > $(jw_walltime_minutes "$v") )); then
+    jw_warn "walltime $WALLTIME exceeds the $v limit of partition $PARTITION (PARTITIONS table in the cluster config)"
+  fi
+  (( TASKS_PER_NODE * CPUS_PER_TASK == CORES_PER_NODE )) || jw_warn "TASKS_PER_NODE*CPUS_PER_TASK = $(( TASKS_PER_NODE * CPUS_PER_TASK )) does not equal CORES_PER_NODE=$CORES_PER_NODE${PARTITION:+ (partition $PARTITION)}"
+}
+
 need_sim() {
   SIMDIR=$(jw_find_simdir "${1:-.}") || jw_die "no simulation here (no .sim_data/config found in $(pwd -P) or its parents)"
   jw_load_sim "$SIMDIR"
@@ -182,7 +205,7 @@ adapt_parfile() {           # <template-file>; sets DRIVER (honours DRIVER_OPT f
 cmd_setup() {
   jw_load_install_config
   ASSUME_YES=no
-  local NAME="" PARTPL="" EXEPATH="" DRIVER_OPT=""
+  local NAME="" PARTPL="" EXEPATH="" DRIVER_OPT="" mem_given=no cores_given=no names
   while [ $# -gt 0 ]; do
     case $1 in
       --name|-N) NAME=$2; shift 2 ;;
@@ -194,7 +217,8 @@ cmd_setup() {
       --nodes) NODES=$2; shift 2 ;;
       --tasks-per-node) TASKS_PER_NODE=$2; shift 2 ;;
       --cpus-per-task) CPUS_PER_TASK=$2; shift 2 ;;
-      --mem) MEM=$2; shift 2 ;;
+      --mem) MEM=$2; mem_given=yes; shift 2 ;;
+      --cores-per-node) CORES_PER_NODE=$2; cores_given=yes; shift 2 ;;
       --account|-A) ACCOUNT=$2; shift 2 ;;
       --qos) QOS=$2; shift 2 ;;
       --exclusive) EXCLUSIVE=yes; shift ;;
@@ -225,12 +249,16 @@ cmd_setup() {
   SETUP_SCRIPT=$(ask "Environment setup script sourced inside the job ('none' = bare login environment)" "${SETUP_SCRIPT:-none}")
   SETUP_SCRIPT=$(check_setup_script "$SETUP_SCRIPT") || exit 1
   [ -n "$SETUP_SCRIPT" ] || jw_warn "no SETUP_SCRIPT: the job runs with the bare login environment (set one with 'jw configure --setup-script FILE')"
-  PARTITION=$(ask "Partition (empty = Slurm default)" "$PARTITION")
+  names=$(jw_partition_names)
+  PARTITION=$(ask "Partition (${names:+$names; }'none' = scheduler default)" "${PARTITION:-none}")
+  [ "$PARTITION" = none ] && PARTITION=""
+  partition_defaults "$mem_given" "$cores_given"
   WALLTIME=$(ask "Walltime per run ([D-]HH:MM:SS)" "$WALLTIME")
   NODES=$(ask "Nodes" "$NODES")
-  TASKS_PER_NODE=$(ask "MPI tasks per node" "$TASKS_PER_NODE")
+  TASKS_PER_NODE=$(ask "MPI tasks per node (${CORES_PER_NODE} cores per node)" "$TASKS_PER_NODE")
   CPUS_PER_TASK=$(ask "OpenMP threads per task" "$CPUS_PER_TASK")
-  MEM=$(ask "Memory per node (--mem, e.g. 16G; empty = Slurm default)" "$MEM")
+  MEM=$(ask "Memory per node (e.g. 16G; 'none' = scheduler default)" "${MEM:-none}")
+  [ "$MEM" = none ] && MEM=""
   MAX_RUNS=$(ask "Maximum number of runs" "$MAX_RUNS")
   QUEUE_DEPTH=$(ask "Successors to keep queued" "$QUEUE_DEPTH")
   RUNTIME_MARGIN_MIN=$(ask "Minutes reserved at the end of each run for the termination checkpoint" "$RUNTIME_MARGIN_MIN")
@@ -238,7 +266,7 @@ cmd_setup() {
 
   local mins; mins=$(jw_walltime_minutes "$WALLTIME")
   (( mins > RUNTIME_MARGIN_MIN )) || jw_die "walltime $WALLTIME is not longer than the margin of $RUNTIME_MARGIN_MIN minutes"
-  (( TASKS_PER_NODE * CPUS_PER_TASK == CORES_PER_NODE )) || jw_warn "TASKS_PER_NODE*CPUS_PER_TASK = $(( TASKS_PER_NODE * CPUS_PER_TASK )) does not equal CORES_PER_NODE=$CORES_PER_NODE"
+  partition_checks
 
   EXE=$(basename "$EXEPATH")
   PARFILE=$(basename "$PARTPL"); PARFILE=${PARFILE%.template}; PARFILE=${PARFILE%.par}.par
@@ -315,13 +343,14 @@ EOT
 usage_setup() {
   cat <<EOT
 jw setup [--name N] [--parfile FILE] [--exe FILE] [--driver carpet|carpetx] [--partition P] [--time W] [--nodes N]
-         [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE] [--account A] [--qos Q] [--exclusive]
-         [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
-         [--mail ADDR] [--mail-events LIST] [--setup-script FILE] [--launcher CMD]
+         [--tasks-per-node T] [--cpus-per-task C] [--cores-per-node N] [--mem SIZE] [--account A]
+         [--qos Q] [--exclusive] [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN]
+         [--hook SCRIPT] [--mail ADDR] [--mail-events LIST] [--setup-script FILE] [--launcher CMD]
          [--strict-checkpoint] [--yes]
 Run it in the (empty) directory that will hold the simulation. Missing values are prompted
 for unless --yes is given, in which case the defaults from the cluster config and
-the user config (written by 'jw configure') are used.
+the user config (written by 'jw configure') are used. Cores per node and the default memory
+come from the partition's line in the cluster config's PARTITIONS table when there is one.
 EOT
 }
 
@@ -373,6 +402,7 @@ cmd_configure() {
       --tasks-per-node) sets+=("TASKS_PER_NODE=$2"); shift 2 ;;
       --cpus-per-task) sets+=("CPUS_PER_TASK=$2"); shift 2 ;;
       --mem) sets+=("MEM=$2"); shift 2 ;;
+      --cores-per-node) sets+=("CORES_PER_NODE=$2"); shift 2 ;;
       --account|-A) sets+=("ACCOUNT=$2"); shift 2 ;;
       --qos) sets+=("QOS=$2"); shift 2 ;;
       --max-runs) sets+=("MAX_RUNS=$2"); shift 2 ;;
@@ -400,12 +430,13 @@ cmd_configure() {
     echo "Enter keeps the value in brackets (your current setting, else the cluster default);"
     echo "'none' clears a path. These become the defaults that 'jw setup' offers."
     sets+=("SETUP_SCRIPT=$(ask "Environment setup script sourced inside every job (modules/spack)" "${SETUP_SCRIPT:-none}")")
-    sets+=("PARTITION=$(ask "Partition ('none' = Slurm default)" "${PARTITION:-none}")")
+    local names; names=$(jw_partition_names)
+    sets+=("PARTITION=$(ask "Partition (${names:+$names; }'none' = scheduler default)" "${PARTITION:-none}")")
     sets+=("WALLTIME=$(ask "Walltime per run ([D-]HH:MM:SS)" "$WALLTIME")")
     sets+=("NODES=$(ask "Nodes" "$NODES")")
     sets+=("TASKS_PER_NODE=$(ask "MPI tasks per node" "$TASKS_PER_NODE")")
     sets+=("CPUS_PER_TASK=$(ask "OpenMP threads per task" "$CPUS_PER_TASK")")
-    sets+=("MEM=$(ask "Memory per node (--mem, e.g. 16G; 'none' = Slurm default)" "${MEM:-none}")")
+    sets+=("MEM=$(ask "Memory per node (e.g. 16G; 'none' = scheduler default, or the partition's default)" "${MEM:-none}")")
     sets+=("ACCOUNT=$(ask "Account/allocation to charge ('none' if the cluster has none)" "${ACCOUNT:-none}")")
     sets+=("QOS=$(ask "QOS ('none' if not used)" "${QOS:-none}")")
     sets+=("QUEUE_DEPTH=$(ask "Successors to keep queued" "$QUEUE_DEPTH")")
@@ -432,7 +463,7 @@ EOT
         [ "$v" = none ] && v=""
         if [ -n "$v" ]; then v=${v/#\~/$HOME}; [ -x "$v" ] || jw_die "POST_RUN_HOOK $v is not an executable file"; v=$(readlink -f "$v"); fi ;;
       WALLTIME) jw_walltime_minutes "$v" >/dev/null 2>&1 || jw_die "WALLTIME '$v' is not of the form [D-]HH:MM:SS" ;;
-      NODES|TASKS_PER_NODE|CPUS_PER_TASK|MAX_RUNS|QUEUE_DEPTH|MIN_PROGRESS|RUNTIME_MARGIN_MIN)
+      NODES|TASKS_PER_NODE|CPUS_PER_TASK|CORES_PER_NODE|MAX_RUNS|QUEUE_DEPTH|MIN_PROGRESS|RUNTIME_MARGIN_MIN)
         [[ $v =~ ^[0-9]+$ ]] || jw_die "$k must be a non-negative integer (got '$v')" ;;
     esac
     config_set "$f" "$k" "$v" || jw_die "cannot write $f"
@@ -448,8 +479,8 @@ usage_configure() {
   cat <<EOT
 jw configure                          interactive: asks for the setup script and the defaults jw setup offers
 jw configure --setup-script FILE      script sourced inside every job to set up modules/spack ('none' = no script)
-jw configure [--partition P] [--time W] [--nodes N] [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE]
-             [--account A] [--qos Q] [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
+jw configure [--partition P] [--time W] [--nodes N] [--tasks-per-node T] [--cpus-per-task C] [--cores-per-node N]
+             [--mem SIZE] [--account A] [--qos Q] [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
              [--mail ADDR] [--mail-events LIST] [--launcher CMD] [KEY=VALUE ...] [--unset KEY ...]
 jw configure --show                   print the file
 Writes $(user_config_file) (\$XDG_CONFIG_HOME/jobwatcher/config; \$JW_CONFIG overrides). Values there override

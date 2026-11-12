@@ -47,7 +47,12 @@ a failing hook fail the run.
 Cluster-wide defaults (partitions, cores per node, launcher, `ENV_INIT`, ...) live in
 `clusters/<cluster>.conf`. The file shipped in `clusters/` is used as long as it is the only one
 there and is the model for adding another cluster; `JW_CLUSTER=<name>` (or a path to a file)
-selects one explicitly.
+selects one explicitly. Its `PARTITIONS` table describes each partition (cores per node, node
+memory, the memory to request by default, walltime limit); `jw setup` takes the core count and
+the memory default from the line of the partition you choose, warns when the walltime exceeds
+the partition's limit or when tasks times threads do not fill a node, and falls back to
+`CORES_PER_NODE` for partitions that are not listed. `--cores-per-node` and `--mem` override
+the table for one simulation.
 
 The batch script is rendered from `templates/<scheduler>/sub.template` (`SCHEDULER` in the
 cluster config, `slurm` today), or from `clusters/<cluster>.sub.template` when a cluster ships
@@ -220,8 +225,8 @@ chain logic only uses the backend's functions. What the backend relies on:
   that a dependency on them cannot be expressed, which is why `jw resume` submits without a
   dependency when the predecessor is gone.
 - On node-exclusive partitions `MEM` can stay empty. On shared partitions set it
-  (`jw setup --mem 16G`, or `MEM=16G` in the config) and keep `TASKS_PER_NODE * CPUS_PER_TASK`
-  within what is free.
+  (`jw setup --mem 16G`, `MEM=16G` in the config, or the `default_mem` column of the cluster's
+  `PARTITIONS` table) and keep `TASKS_PER_NODE * CPUS_PER_TASK` within what is free.
 - Jobs are submitted with `--export=NONE` (`SBATCH_EXPORT`), so Slurm gives every job a fresh
   login environment instead of a copy of the submitter's; a successor submitted from inside a
   running job therefore sees exactly what a job submitted from the login node sees, nothing is

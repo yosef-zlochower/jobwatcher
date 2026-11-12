@@ -146,8 +146,7 @@ config variables and `eval` it in `jw_job.sh`.)
   the code or README.
 - `bin/jw`: `write_config` writes `SBATCH_EXPORT`; add the PBS knob (e.g. `QSUB_OPTS`) the same
   way if the backend has one, or make `write_config` emit backend knobs through a backend
-  function. Prompts in `jw setup`/`jw configure` say "Slurm default" for partition and memory:
-  reword generically or per backend.
+  function.
 - README: the "What JobWatcher assumes about Slurm" section gets a sibling for PBS, or is
   rewritten as a per-scheduler table. Keep it for new users: no site names, no personal paths.
 

@@ -14,7 +14,7 @@ jw_info() { echo "jw: $*" >&2; }
 # still works. Keys only one backend reads are defaulted by that backend (jw_sched_defaults).
 jw_apply_defaults() {
   : "${MASTERNODE:=}"
-  : "${SCHEDULER:=slurm}"
+  : "${SCHEDULER:=slurm}" "${PARTITIONS:=}"
   : "${PARTITION:=}" "${WALLTIME:=24:00:00}" "${NODES:=1}"
   : "${TASKS_PER_NODE:=1}" "${CPUS_PER_TASK:=1}" "${MEM:=}" "${ACCOUNT:=}" "${QOS:=}" "${EXCLUSIVE:=no}"
   : "${CORES_PER_NODE:=$(( TASKS_PER_NODE * CPUS_PER_TASK ))}"
@@ -26,6 +26,31 @@ jw_apply_defaults() {
   : "${POST_RUN_HOOK:=}" "${HOOK_FAILURE_FATAL:=no}"
   : "${DRIVER:=carpet}" "${ENV_INIT:=}"
   jw_sched_defaults
+}
+
+# ---------------------------------------------------------------- partitions
+# PARTITIONS (cluster config) describes the partitions, one per line:
+#   name  cores  node_mem  default_mem  max_walltime     ('-' = unknown / no default; '#' comments)
+# jw_partition_field <partition> <field>: prints the value ('' for '-'); rc 1 when the partition is not listed.
+jw_partition_field() {
+  local n c nm dm w v
+  while read -r n c nm dm w _; do
+    case $n in ''|'#'*) continue ;; esac
+    [ "$n" = "$1" ] || continue
+    case $2 in cores) v=$c ;; node_mem) v=$nm ;; default_mem) v=$dm ;; max_walltime) v=$w ;; *) v="" ;; esac
+    case $v in -|'#'*) v="" ;; esac
+    echo "$v"; return 0
+  done <<<"$PARTITIONS"
+  return 1
+}
+# jw_partition_names: the listed partition names, comma separated ('' when there is no table).
+jw_partition_names() {
+  local n names=""
+  while read -r n _; do
+    case $n in ''|'#'*) continue ;; esac
+    names+="${names:+, }$n"
+  done <<<"$PARTITIONS"
+  echo "$names"
 }
 
 # ---------------------------------------------------------------- scheduler backend
