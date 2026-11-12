@@ -6,7 +6,7 @@ keeps a successor queued behind itself with `--dependency=afterok`, and classifi
 own outcome (SUCCESS, COMPLETE, FAILED) before exiting.
 
 ```
-jw configure [options]   write ~/.JobWatcher/config: environment setup script and personal defaults
+jw configure [options]   write ~/.config/jobwatcher/config: environment setup script and personal defaults
 jw setup  [options]      create a simulation in the current directory
 jw start  [-n DEPTH]     create Run1, submit it, keep DEPTH successors queued
 jw status                show every run, its Slurm state and progress
@@ -28,9 +28,10 @@ ln -s ${JW_DIR}/bin/jw ~/bin/
 jw configure                 # once: environment setup script and personal defaults
 ```
 
-The only fixed path is the user configuration, `~/.JobWatcher/config` (override with `$JW_CONFIG`).
+The only fixed path is the user configuration, `~/.config/jobwatcher/config` (honours
+`$XDG_CONFIG_HOME`; `$JW_CONFIG` overrides the location).
 
-`jw configure` writes `~/.JobWatcher/config`. Its one essential entry is `SETUP_SCRIPT`, the
+`jw configure` writes `~/.config/jobwatcher/config`. Its one essential entry is `SETUP_SCRIPT`, the
 script every job sources to set up modules/spack before launching Cactus; the cluster config
 deliberately leaves it empty because it is personal. Interactive `jw configure` also asks for
 the defaults that `jw setup` will offer (partition, walltime, nodes, mail, ...). Non-interactive
@@ -43,9 +44,9 @@ for new simulations, `jw setup --hook` sets it for one, and `POST_RUN_HOOK=/path
 `<simdir>/.sim_data/config` changes it for the runs that follow. `HOOK_FAILURE_FATAL=yes` makes
 a failing hook fail the run.
 
-Configuration precedence: `clusters/gp.conf` < `~/.JobWatcher/config` (`jw configure`) < `jw setup`
-options < edits to `<simdir>/.sim_data/config`. Existing simulations are self-contained: changing
-`~/.JobWatcher/config` affects only simulations set up afterwards.
+Configuration precedence: `clusters/gp.conf` < `~/.config/jobwatcher/config` (`jw configure`) <
+`jw setup` options < edits to `<simdir>/.sim_data/config`. Existing simulations are self-contained:
+changing the user config affects only simulations set up afterwards.
 
 ## Starting a simulation
 

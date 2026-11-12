@@ -1,7 +1,7 @@
 #!/bin/bash
 # jw - JobWatcher command line (Slurm edition).
 #
-#   jw configure [options]  write ~/.JobWatcher/config: environment setup script and personal defaults
+#   jw configure [options]  write ~/.config/jobwatcher/config: environment setup script and personal defaults
 #   jw setup  [options]      create a simulation in the current directory
 #   jw start  [-n DEPTH]     create Run1, submit it, and queue DEPTH successors
 #   jw status                show every run, its Slurm state and progress
@@ -12,8 +12,9 @@
 #   jw config                show the effective configuration
 #   jw help
 #
-# Config precedence: clusters/<JW_CLUSTER>.conf < ~/.JobWatcher/config (or $JW_CONFIG, written by
-# jw configure) < jw setup options < edits to <simdir>/.sim_data/config.
+# Config precedence: clusters/<JW_CLUSTER>.conf < the user config (written by jw configure:
+# $JW_CONFIG, else $XDG_CONFIG_HOME/jobwatcher/config, else ~/.config/jobwatcher/config)
+# < jw setup options < edits to <simdir>/.sim_data/config.
 
 set -uo pipefail
 
@@ -21,12 +22,19 @@ JW_BIN=$(readlink -f "${BASH_SOURCE[0]}")
 JW_HOME=$(cd "$(dirname "$JW_BIN")/.." && pwd -P)
 . "$JW_HOME/lib/jw_common.sh"
 
+user_config_file()     { echo "${JW_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jobwatcher/config}"; }
+old_user_config_file() { echo "$HOME/.JobWatcher/config"; }     # location before 2026-11; read if the new one is absent
+
 jw_load_install_config() {
   local cluster=${JW_CLUSTER:-gp} f
   f="$JW_HOME/clusters/$cluster.conf"
   [ -r "$f" ] && . "$f"
-  f=${JW_CONFIG:-$HOME/.JobWatcher/config}
-  [ -r "$f" ] && . "$f"
+  f=$(user_config_file)
+  if [ -r "$f" ]; then . "$f"
+  elif [ -z "${JW_CONFIG:-}" ] && [ -r "$(old_user_config_file)" ]; then
+    . "$(old_user_config_file)"
+    jw_info "reading $(old_user_config_file); run 'jw configure' once to move it to $f"
+  fi
   jw_apply_defaults
 }
 
@@ -273,15 +281,15 @@ jw setup [--name N] [--parfile FILE] [--exe FILE] [--driver carpet|carpetx] [--p
          [--setup-script FILE] [--launcher CMD] [--strict-checkpoint] [--yes]
 Run it in the (empty) directory that will hold the simulation. Missing values are prompted
 for unless --yes is given, in which case the defaults from the cluster config and
-~/.JobWatcher/config (written by 'jw configure') are used.
+the user config (written by 'jw configure') are used.
 EOT
 }
 
 # ---------------------------------------------------------------- configure
-# ~/.JobWatcher/config (or $JW_CONFIG) holds the user's own defaults: the environment setup
-# script that every job sources, and whatever cluster defaults the user wants changed for every
-# new simulation.  bash sources it after clusters/<cluster>.conf, so values may use $HOME.
-user_config_file() { echo "${JW_CONFIG:-$HOME/.JobWatcher/config}"; }
+# The user config (~/.config/jobwatcher/config, see user_config_file) holds the user's own
+# defaults: the environment setup script that every job sources, and whatever cluster defaults
+# the user wants changed for every new simulation.  bash sources it after clusters/<cluster>.conf,
+# so values may use $HOME.
 
 config_set() {              # <file> <KEY> <value>: replace the last KEY= line, else append KEY="value"
   local f=$1 k=$2 v=$3 n tmp
@@ -363,6 +371,10 @@ cmd_configure() {
   fi
   known=$(known_keys)
   mkdir -p "$(dirname "$f")" || jw_die "cannot create $(dirname "$f")"
+  if [ ! -f "$f" ] && [ -z "${JW_CONFIG:-}" ] && [ -r "$(old_user_config_file)" ]; then
+    cp "$(old_user_config_file)" "$f" || jw_die "cannot copy $(old_user_config_file) to $f"
+    echo "moved your settings from $(old_user_config_file) to $f (the old file is no longer read; delete it)"
+  fi
   [ -f "$f" ] || cat > "$f" <<EOT
 # JobWatcher user configuration (created $(date '+%Y-%m-%d') by jw configure).
 # bash sources it after clusters/<cluster>.conf: every value here overrides the cluster default
@@ -399,7 +411,7 @@ jw configure [--partition P] [--time W] [--nodes N] [--tasks-per-node T] [--cpus
              [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
              [--mail ADDR] [--mail-events LIST] [--launcher CMD] [KEY=VALUE ...] [--unset KEY ...]
 jw configure --show                   print the file
-Writes $(user_config_file) (override the location with \$JW_CONFIG). Values there override
+Writes $(user_config_file) (\$XDG_CONFIG_HOME/jobwatcher/config; \$JW_CONFIG overrides). Values there override
 clusters/<cluster>.conf and are the defaults jw setup offers; every KEY from the cluster config
 can be set.  Existing simulations are not changed (their .sim_data/config is self-contained).
 EOT
