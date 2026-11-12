@@ -1,4 +1,4 @@
-# JobWatcher — chained Cactus runs under Slurm on green-prairies
+# JobWatcher — chained Cactus runs under Slurm
 
 `jw` runs one Cactus simulation as a chain of Slurm jobs. Each job recovers from the
 checkpoint written by its predecessor, verifies that the predecessor really succeeded,
@@ -35,7 +35,7 @@ The only fixed path is the user configuration, `~/.config/jobwatcher/config` (ho
 script every job sources to set up modules/spack before launching Cactus; the cluster config
 deliberately leaves it empty because it is personal. Interactive `jw configure` also asks for
 the defaults that `jw setup` will offer (partition, walltime, nodes, mail, ...). Non-interactive
-forms: `jw configure --setup-script FILE --partition gp-long`, `jw configure KEY=VALUE`,
+forms: `jw configure --setup-script FILE --partition long`, `jw configure KEY=VALUE`,
 `--unset KEY`, `--show`. The file is plain bash and can be edited by hand.
 
 A post-run hook (a script of your own that runs at the end of every successful run, see Hooks
@@ -44,16 +44,20 @@ for new simulations, `jw setup --hook` sets it for one, and `POST_RUN_HOOK=/path
 `<simdir>/.sim_data/config` changes it for the runs that follow. `HOOK_FAILURE_FATAL=yes` makes
 a failing hook fail the run.
 
-Configuration precedence: `clusters/gp.conf` < `~/.config/jobwatcher/config` (`jw configure`) <
-`jw setup` options < edits to `<simdir>/.sim_data/config`. Existing simulations are self-contained:
-changing the user config affects only simulations set up afterwards.
+Cluster-wide defaults (partitions, cores per node, launcher, `ENV_INIT`, ...) live in
+`clusters/<cluster>.conf`; `$JW_CLUSTER` selects the file, and the one shipped in `clusters/` is
+the model for adding another cluster.
+
+Configuration precedence: `clusters/<cluster>.conf` < `~/.config/jobwatcher/config` (`jw configure`)
+< `jw setup` options < edits to `<simdir>/.sim_data/config`. Existing simulations are
+self-contained: changing the user config affects only simulations set up afterwards.
 
 ## Starting a simulation
 
 ```
 mkdir /scratch/$USER/q1 && cd /scratch/$USER/q1
 jw setup --name q1 --parfile /path/to/q1.par --exe /path/to/Cactus/exe/cactus_sim \
-         --partition gp-long --time 2-00:00:00 --nodes 4
+         --partition long --time 2-00:00:00 --nodes 4
 jw start
 ```
 
@@ -185,29 +189,30 @@ or `POST_RUN_HOOK=/path/to/script` in a config. The interface:
   parent of `<rundir>`; `jw_run_dirs` then lists the run directories in order and
   `jw_status_get <dir>/status state` tells which of them succeeded.
 
-## Cluster assumptions (green-prairies, Slurm 23.11)
+## What JobWatcher assumes about Slurm
 
-- `gp-default` (2 days) and `gp-long` (20 days) are node-exclusive, so `MEM` can stay empty
-  there. `debug` (12 h) and `lm-largemem` share the 48-core, 770 GB node `lm-n0001` and default
-  to 2 GB per CPU: set `MEM` (`jw setup --mem 16G`, or `MEM=16G` in the config) when using them,
-  and keep `TASKS_PER_NODE * CPUS_PER_TASK` within what is free. Use `debug` for short tests.
-- Slurm accounting is disabled, so `sacct` cannot tell whether a job succeeded; JobWatcher
-  relies on its own status files and on `afterok`.
-- `sbatch`, `squeue`, `scontrol` and `scancel` work on compute nodes, and a job submitted from
-  inside a job with `--dependency=afterok` runs. There is **no `mail` command on compute nodes**, so JobWatcher's
-  summary mails go through `ssh $MASTERNODE mail ...` (passwordless ssh from the nodes to
-  green-prairies works). Slurm's own `--mail-type` mails are sent by the controller and need
-  nothing from the node. Every scheduler call also has the same ssh fallback.
-- Finished jobs stay visible to `squeue` for `MinJobAge` (5 min); after that a dependency on
-  them cannot be expressed, which is why `jw resume` submits without a dependency when the
-  predecessor is gone.
+- `sbatch`, `squeue`, `scontrol` and `scancel` must work on compute nodes, and a job must be
+  allowed to submit another job with `--dependency=afterok`: successors are queued from inside
+  the running job. If a compute node cannot run them, or has no `mail` command for the summary
+  mails, every such call falls back to `ssh $MASTERNODE ...` (set `MASTERNODE` in the cluster
+  config; passwordless ssh from the nodes is then required). Slurm's own `--mail-type` mails are
+  sent by the controller and need nothing from the node.
+- Slurm accounting is not needed: JobWatcher never consults `sacct`, only its own status files
+  and `afterok`.
+- Finished jobs stay visible to `squeue` only for `MinJobAge` (typically a few minutes); after
+  that a dependency on them cannot be expressed, which is why `jw resume` submits without a
+  dependency when the predecessor is gone.
+- On node-exclusive partitions `MEM` can stay empty. On shared partitions set it
+  (`jw setup --mem 16G`, or `MEM=16G` in the config) and keep `TASKS_PER_NODE * CPUS_PER_TASK`
+  within what is free.
 - Jobs are submitted with `--export=NONE` (`SBATCH_EXPORT`), so Slurm gives every job a fresh
   login environment instead of a copy of the submitter's; a successor submitted from inside a
   running job therefore sees exactly what a job submitted from the login node sees, nothing is
-  inherited from the parent job. The job then evaluates `ENV_INIT` (defines `module`, since `/etc/profile.d/lmod.sh` is a no-op under
-  Slurm), sources `SETUP_SCRIPT` and sets `SLURM_EXPORT_ENV=ALL` so that `srun` passes that
-  environment to the Cactus tasks (with `NONE` still in force the tasks would start without
-  `HOME`/`PATH` and OpenMPI's `MPI_Init` fails with "Unable to get the user home directory").
+  inherited from the parent job. The job then evaluates `ENV_INIT` from the cluster config (for
+  example to define `module` where `/etc/profile.d/lmod.sh` is skipped under Slurm), sources
+  `SETUP_SCRIPT` and sets `SLURM_EXPORT_ENV=ALL` so that `srun` passes that environment to the
+  Cactus tasks (with `NONE` still in force the tasks would start without `HOME`/`PATH` and
+  OpenMPI's `MPI_Init` fails with "Unable to get the user home directory").
 
 ## Tests
 
