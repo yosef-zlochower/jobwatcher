@@ -4,10 +4,10 @@
 #   jw configure [options]  write ~/.config/jobwatcher/config: environment setup script and personal defaults
 #   jw setup  [options]      create a simulation in the current directory
 #   jw start  [-n DEPTH]     create Run1, submit it, and queue DEPTH successors
-#   jw status                show every run, its Slurm state and progress
+#   jw status                show every run, its scheduler state and progress
 #   jw stop   [--kill]       create STOP, cancel queued successors (--kill: also the running job)
 #   jw resume [-n DEPTH]     remove STOP, move failed runs aside, submit the next run
-#   jw sync                  copy the current library and batch template into .sim_data
+#   jw sync                  copy the current library, scheduler backend and batch template into .sim_data
 #   jw log                   show chain.log
 #   jw config                show the effective configuration
 #   jw help
@@ -53,7 +53,21 @@ jw_load_install_config() {
   . "$f"
   f=$(user_config_file)
   [ -r "$f" ] && . "$f"
+  jw_load_sched
   jw_apply_defaults
+}
+
+# install_sim_files <simdir>: copy the library, the scheduler backend and the batch template into
+# .sim_data, each via a temporary file, so that a job starting meanwhile never sees a half-written file.
+install_sim_files() {
+  local sd=$1/.sim_data f tpl
+  tpl=$(sub_template_file) || return 1
+  [ -r "$tpl" ] || { jw_warn "batch template $tpl not found"; return 1; }
+  for f in "$JW_HOME/lib/jw_common.sh:jw_common.sh" "$JW_HOME/lib/jw_job.sh:jw_job.sh" \
+           "$JW_HOME/lib/sched/$SCHEDULER.sh:jw_sched.sh" "$tpl:sub.template"; do
+    cp "${f%%:*}" "$sd/${f##*:}.tmp.$$" && mv -f "$sd/${f##*:}.tmp.$$" "$sd/${f##*:}" || return 1
+  done
+  echo "$tpl"
 }
 
 need_sim() {
@@ -183,6 +197,7 @@ cmd_setup() {
       --mem) MEM=$2; shift 2 ;;
       --account|-A) ACCOUNT=$2; shift 2 ;;
       --qos) QOS=$2; shift 2 ;;
+      --exclusive) EXCLUSIVE=yes; shift ;;
       --max-runs) MAX_RUNS=$2; shift 2 ;;
       --queue-depth) QUEUE_DEPTH=$2; shift 2 ;;
       --min-progress) MIN_PROGRESS=$2; shift 2 ;;
@@ -239,9 +254,7 @@ cmd_setup() {
   cp "$EXEPATH" "$sd/$EXE" || jw_die "cannot copy executable"
   cp "$PARTPL" "$sd/parfile.template" || jw_die "cannot copy parameter file"
   adapt_parfile "$sd/parfile.template"
-  local tpl; tpl=$(sub_template_file) || exit 1
-  [ -r "$tpl" ] || jw_die "batch template $tpl not found"
-  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$sd/" && cp "$tpl" "$sd/sub.template" || jw_die "cannot copy the library"
+  install_sim_files "$SIMDIR" >/dev/null || jw_die "cannot install the library into $sd"
   echo 0 > "$sd/last"
   write_config "$sd/config" "$NAME"
   jw_log setup - CREATED "name=$NAME exe=$EXE parfile=$PARFILE nodes=$NODES walltime=$WALLTIME partition=$PARTITION"
@@ -272,9 +285,10 @@ CPUS_PER_TASK=$CPUS_PER_TASK
 MEM=$MEM
 ACCOUNT=$ACCOUNT
 QOS=$QOS
-SBATCH_EXTRA=$(printf %q "$SBATCH_EXTRA")
-SBATCH_EXPORT=$SBATCH_EXPORT
+EXCLUSIVE=$EXCLUSIVE
+HEADER_EXTRA=$(printf %q "$HEADER_EXTRA")
 SCHEDULER=$SCHEDULER
+SBATCH_EXPORT=$SBATCH_EXPORT
 
 ENV_INIT=$(printf %q "$ENV_INIT")
 SETUP_SCRIPT=$(printf %q "$SETUP_SCRIPT")
@@ -284,7 +298,7 @@ OMP_PLACES=$OMP_PLACES
 EXTRA_ENV=$(printf %q "$EXTRA_ENV")
 
 MAIL=$MAIL
-SLURM_MAIL_TYPE=$SLURM_MAIL_TYPE
+MAIL_TYPE=$MAIL_TYPE
 MAIL_EVENTS=$MAIL_EVENTS
 MASTERNODE=$MASTERNODE
 
@@ -301,7 +315,7 @@ EOT
 usage_setup() {
   cat <<EOT
 jw setup [--name N] [--parfile FILE] [--exe FILE] [--driver carpet|carpetx] [--partition P] [--time W] [--nodes N]
-         [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE] [--account A] [--qos Q]
+         [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE] [--account A] [--qos Q] [--exclusive]
          [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
          [--mail ADDR] [--mail-events LIST] [--setup-script FILE] [--launcher CMD]
          [--strict-checkpoint] [--yes]
@@ -469,7 +483,7 @@ cmd_resume() {
     case $st in QUEUED|RUNNING)
       jw_job_in_queue "$job"; case $? in
         0) jw_die "$(basename "$dir") (job $job) is still $(jw_job_state "$job"); nothing to resume. Use 'jw stop --kill' first if you really want to restart it." ;;
-        2) jw_die "cannot query Slurm about job $job" ;;
+        2) jw_die "cannot query the scheduler about job $job" ;;
       esac ;;
     esac
   done
@@ -515,12 +529,12 @@ cmd_stop() {
     n=$(jw_run_index "$dir"); st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
     case $st in
       QUEUED|PREPARED)
-        [ -n "$job" ] && jw_scancel "$job"
+        [ -n "$job" ] && jw_sched_cancel "$job"
         jw_status_set "$dir/status" state=CANCELLED reason="jw stop" end="$(date +%s)"
         jw_log "Run$n" "$job" CANCELLED "jw stop"; echo "cancelled Run$n (job ${job:-none})" ;;
       RUNNING)
         if [ $kill = yes ]; then
-          jw_scancel "$job"; jw_log "Run$n" "$job" KILLED "jw stop --kill"; echo "killed Run$n (job $job)"
+          jw_sched_cancel "$job"; jw_log "Run$n" "$job" KILLED "jw stop --kill"; echo "killed Run$n (job $job)"
         else
           echo "Run$n (job $job) keeps running; it will not queue a successor. Use --kill to cancel it."
         fi ;;
@@ -537,7 +551,7 @@ cmd_status() {
   ck=$(jw_latest_checkpoint_iter)
   echo "  last successful iteration: $(cat "$SIMDIR/.sim_data/last" 2>/dev/null)   newest checkpoint: ${ck:-none}   STOP: $([ -e "$SIMDIR/STOP" ] && echo present || echo no)"
   echo "  driver=$DRIVER partition=$PARTITION walltime=$WALLTIME nodes=$NODES tasks/node=$TASKS_PER_NODE cpus/task=$CPUS_PER_TASK queue_depth=$QUEUE_DEPTH max_runs=$MAX_RUNS"
-  printf '  %-7s %-10s %-8s %-10s %-10s %-12s %-9s %s\n' RUN STATE JOB SLURM ITER TIME ELAPSED REASON
+  printf '  %-7s %-10s %-8s %-10s %-10s %-12s %-9s %s\n' RUN STATE JOB SCHED ITER TIME ELAPSED REASON
   for dir in $(jw_run_dirs); do
     n=$(jw_run_index "$dir"); st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
     it=$(jw_status_get "$dir/status" iter); tm=$(jw_status_get "$dir/status" time); r=$(jw_status_get "$dir/status" reason)
@@ -556,9 +570,8 @@ cmd_sync() {
   need_sim
   local par=no
   while [ $# -gt 0 ]; do case $1 in --parfile) par=yes; shift ;; *) jw_die "sync: unknown option $1 (only --parfile)" ;; esac; done
-  local tpl; tpl=$(sub_template_file) || exit 1
-  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$SIMDIR/.sim_data/" && cp "$tpl" "$SIMDIR/.sim_data/sub.template" || jw_die "copy failed"
-  jw_log sync - SYNC "library and template updated from $JW_HOME (jw $JW_VERSION)"
+  local tpl; tpl=$(install_sim_files "$SIMDIR") || jw_die "copy failed"
+  jw_log sync - SYNC "library, $SCHEDULER backend and template ($tpl) updated from $JW_HOME (jw $JW_VERSION)"
   echo "updated $SIMDIR/.sim_data from $JW_HOME; every job that starts from now on (including already-queued ones) runs the new jw_job.sh"
   if [ $par = yes ]; then
     cp "$SIMDIR/.sim_data/parfile.template" "$SIMDIR/.sim_data/parfile.template.bak.$(date +%s)"

@@ -10,29 +10,80 @@ jw_warn() { echo "jw: WARNING: $*" >&2; }
 jw_info() { echo "jw: $*" >&2; }
 
 # ---------------------------------------------------------------- defaults
-# Applied after the config files so that an old config missing a key still works.
+# Applied after the config files and the scheduler backend, so that a config missing a key
+# still works. Keys only one backend reads are defaulted by that backend (jw_sched_defaults).
 jw_apply_defaults() {
   : "${MASTERNODE:=}"
-  : "${PARTITION:=}" "${WALLTIME:=24:00:00}" "${NODES:=1}"
-  : "${TASKS_PER_NODE:=1}" "${CPUS_PER_TASK:=1}" "${MEM:=}" "${ACCOUNT:=}" "${QOS:=}"
   : "${SCHEDULER:=slurm}"
+  : "${PARTITION:=}" "${WALLTIME:=24:00:00}" "${NODES:=1}"
+  : "${TASKS_PER_NODE:=1}" "${CPUS_PER_TASK:=1}" "${MEM:=}" "${ACCOUNT:=}" "${QOS:=}" "${EXCLUSIVE:=no}"
   : "${CORES_PER_NODE:=$(( TASKS_PER_NODE * CPUS_PER_TASK ))}"
-  : "${SETUP_SCRIPT:=}" "${LAUNCHER:=srun}"
-  : "${OMP_PROC_BIND:=close}" "${OMP_PLACES:=cores}" "${EXTRA_ENV:=}" "${SBATCH_EXTRA:=}"
-  : "${MAIL:=$USER}" "${SLURM_MAIL_TYPE:=FAIL}" "${MAIL_EVENTS:=fail,complete}"
+  : "${SETUP_SCRIPT:=}"
+  : "${OMP_PROC_BIND:=close}" "${OMP_PLACES:=cores}" "${EXTRA_ENV:=}" "${HEADER_EXTRA:=}"
+  : "${MAIL:=$USER}" "${MAIL_TYPE:=FAIL}" "${MAIL_EVENTS:=fail,complete}"
   : "${MAX_RUNS:=100}" "${QUEUE_DEPTH:=1}" "${MIN_PROGRESS:=100}"
   : "${RUNTIME_MARGIN_MIN:=20}" "${STRICT_CHECKPOINT:=no}"
   : "${POST_RUN_HOOK:=}" "${HOOK_FAILURE_FATAL:=no}"
-  : "${DRIVER:=carpet}" "${SBATCH_EXPORT:=NONE}" "${ENV_INIT:=}"
+  : "${DRIVER:=carpet}" "${ENV_INIT:=}"
+  jw_sched_defaults
+}
+
+# ---------------------------------------------------------------- scheduler backend
+# The scheduler is behind a fixed set of jw_sched_* functions (docs/scheduler-backends.md),
+# implemented in lib/sched/<SCHEDULER>.sh and frozen with the simulation as .sim_data/jw_sched.sh.
+# jw_load_sched: source the backend and check that it implements the whole contract.
+jw_load_sched() {
+  local f fn s=${SCHEDULER:-slurm}
+  if [ -n "${SIMDIR:-}" ] && [ -r "$SIMDIR/.sim_data/jw_sched.sh" ]; then f=$SIMDIR/.sim_data/jw_sched.sh
+  else f=${JW_HOME:?}/lib/sched/$s.sh; fi
+  [ -r "$f" ] || jw_die "no scheduler backend for SCHEDULER=$s ($f)"
+  . "$f"
+  [ "${JW_SCHED_NAME:-}" = "$s" ] || jw_die "$f implements '${JW_SCHED_NAME:-?}' but the configuration says SCHEDULER=$s"
+  for fn in defaults submit cancel state job_env launcher_env walltime mem header exec_line timelimit_regex jobid_ok; do
+    declare -F "jw_sched_$fn" >/dev/null || jw_die "$f does not define jw_sched_$fn"
+  done
+}
+
+# jw_sched_cmd <cmd> args...: run a scheduler command; when it is missing or fails inside a job
+# and MASTERNODE is set, run it there over ssh (compute nodes without working client commands).
+jw_sched_cmd() {
+  local out rc
+  if command -v "$1" >/dev/null 2>&1; then
+    out=$("$@" 2>&1); rc=$?
+    [ $rc -eq 0 ] && { printf '%s\n' "$out"; return 0; }
+  else
+    out="$1: command not found"; rc=127
+  fi
+  if [ -n "$MASTERNODE" ] && [ "${JW_IN_JOB:-}" = yes ]; then
+    out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$MASTERNODE" "cd $(printf %q "$PWD") && $(printf '%q ' "$@")" 2>&1); rc=$?
+    [ $rc -eq 0 ] && { printf '%s\n' "$out"; return 0; }
+  fi
+  printf '%s\n' "$out" >&2
+  return $rc
+}
+
+# jw_job_state <jobid> -> the scheduler's own state name, or "" when the job is not known any
+# more. Returns 1 if the query itself failed (distinguishes "gone" from "cannot tell").
+jw_job_state() {
+  local s; s=$(jw_sched_state "$1") || return 1
+  s=${s#* }; [ "$s" = - ] && s=""
+  echo "$s"
+}
+# jw_job_in_queue <jobid>: 0 = still queued or running, 1 = finished or unknown, 2 = query failed.
+jw_job_in_queue() {
+  local s; s=$(jw_sched_state "$1") || return 2
+  case ${s%% *} in queued|running) return 0 ;; esac
+  return 1
 }
 
 # ---------------------------------------------------------------- simulation
-# jw_load_sim <simdir>: sources .sim_data/config and sets SIMDIR, CHECKPOINT_DIR.
+# jw_load_sim <simdir>: sources .sim_data/config and the frozen backend; sets SIMDIR, CHECKPOINT_DIR.
 jw_load_sim() {
   local d=$1
   [ -r "$d/.sim_data/config" ] || return 1
   SIMDIR=$(cd "$d" && pwd -P)
   . "$SIMDIR/.sim_data/config"
+  jw_load_sched
   jw_apply_defaults
   : "${CHECKPOINT_DIR:=$SIMDIR/CheckPoint}"
   return 0
@@ -213,55 +264,7 @@ jw_term_write_ok() {
   return 1
 }
 
-# ---------------------------------------------------------------- Slurm
-# All scheduler commands go through jw_slurm so that a compute node without
-# working client commands can fall back to ssh'ing to MASTERNODE.
-jw_slurm() {                # <cmd> args...
-  local out rc
-  if command -v "$1" >/dev/null 2>&1; then
-    out=$("$@" 2>&1); rc=$?
-    [ $rc -eq 0 ] && { printf '%s\n' "$out"; return 0; }
-  else
-    out="$1: command not found"; rc=127
-  fi
-  if [ -n "$MASTERNODE" ] && [ -n "${SLURM_JOB_ID:-}" ]; then
-    out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$MASTERNODE" "cd $(printf %q "$PWD") && $(printf '%q ' "$@")" 2>&1); rc=$?
-    [ $rc -eq 0 ] && { printf '%s\n' "$out"; return 0; }
-  fi
-  printf '%s\n' "$out" >&2
-  return $rc
-}
-
-# jw_sbatch args... -> job id on stdout, nothing on failure.
-jw_sbatch() {
-  local out
-  out=$(jw_slurm sbatch --parsable --export="$SBATCH_EXPORT" "$@") || return 1
-  out=${out%%;*}
-  [[ $out =~ ^[0-9]+$ ]] || { jw_warn "sbatch returned unexpected output: $out"; return 1; }
-  echo "$out"
-}
-
-# jw_job_state <jobid> -> Slurm state (PENDING, RUNNING, COMPLETED, ...) or "" if unknown to the controller.
-# Returns 1 if the query itself failed (distinguishes "gone" from "cannot tell").
-jw_job_state() {
-  local out
-  [ -n "$1" ] || { echo ""; return 0; }
-  if out=$(jw_slurm squeue -h -j "$1" -o %T 2>&1); then
-    echo "${out%%$'\n'*}"; return 0
-  fi
-  # After MinJobAge the controller forgets a finished job and squeue -j fails with this message.
-  [[ $out == *"Invalid job id specified"* ]] && { echo ""; return 0; }
-  printf '%s\n' "$out" >&2
-  return 1
-}
-# jw_job_in_queue <jobid>: 0 = still pending/running, 1 = finished or unknown, 2 = query failed.
-jw_job_in_queue() {
-  local st; st=$(jw_job_state "$1") || return 2
-  case $st in PENDING|RUNNING|SUSPENDED|CONFIGURING|COMPLETING|REQUEUED|RESIZING|REVOKED|SIGNALING|STAGE_OUT) return 0 ;; esac
-  return 1
-}
-jw_scancel() { [ -n "$1" ] && jw_slurm scancel "$1" >/dev/null 2>&1; }
-
+# ---------------------------------------------------------------- successors
 # jw_cancel_successors <N>: cancel every queued Run beyond N (marks them CANCELLED).
 jw_cancel_successors() {
   local n=$1 dir m st job
@@ -270,7 +273,7 @@ jw_cancel_successors() {
     st=$(jw_status_get "$dir/status" state); job=$(jw_status_get "$dir/status" jobid)
     case $st in
       QUEUED|PREPARED)
-        [ -n "$job" ] && jw_scancel "$job"
+        [ -n "$job" ] && jw_sched_cancel "$job"
         jw_status_set "$dir/status" state=CANCELLED reason="cancelled by Run$n" end="$(date +%s)"
         jw_log "Run$m" "$job" CANCELLED "by Run$n" ;;
     esac
@@ -307,15 +310,21 @@ jw_prepare_run() {
   MAX_RUNTIME=$(( WALLTIME_MIN - RUNTIME_MARGIN_MIN ))
   (( MAX_RUNTIME > 0 )) || { jw_warn "WALLTIME $WALLTIME minus RUNTIME_MARGIN_MIN $RUNTIME_MARGIN_MIN is not positive"; return 1; }
   WALLTIME_HOURS=$(awk -v m="$WALLTIME_MIN" 'BEGIN{printf "%g", m / 60}')   # for TerminationTrigger::max_walltime
-  # optional header lines: rendered only when the value is set
-  local SBATCH_MEM="" SBATCH_PARTITION="" SBATCH_ACCOUNT="" SBATCH_QOS=""
-  [ -n "$MEM" ]       && SBATCH_MEM="#SBATCH --mem=$MEM"
-  [ -n "$PARTITION" ] && SBATCH_PARTITION="#SBATCH --partition=$PARTITION"
-  [ -n "$ACCOUNT" ]   && SBATCH_ACCOUNT="#SBATCH --account=$ACCOUNT"
-  [ -n "$QOS" ]       && SBATCH_QOS="#SBATCH --qos=$QOS"
+  # Batch script: the backend renders the optional directive lines (empty when the key is unset),
+  # the scheduler's spelling of walltime and memory, and the trailer that runs jw_job.sh.
+  local RUNDIR=$dir CPUS_PER_NODE=$(( TASKS_PER_NODE * CPUS_PER_TASK )) NTASKS=$(( NODES * TASKS_PER_NODE )) NSLOTS=$(( NODES * TASKS_PER_NODE * CPUS_PER_TASK ))
+  local h_part h_acct h_qos h_mem h_mail h_excl h_extra h_exec w m
+  h_part=$(jw_sched_header partition); h_acct=$(jw_sched_header account); h_qos=$(jw_sched_header qos)
+  h_mem=$(jw_sched_header mem); h_mail=$(jw_sched_header mail); h_excl=$(jw_sched_header exclusive)
+  h_extra=$(jw_sched_header extra); h_exec=$(jw_sched_exec_line)
+  w=$(jw_sched_walltime "$WALLTIME") || return 1
+  m=$(jw_sched_mem "$MEM") || return 1
+  local HEADER_PARTITION=$h_part HEADER_ACCOUNT=$h_acct HEADER_QOS=$h_qos HEADER_MEM=$h_mem HEADER_MAIL=$h_mail \
+        HEADER_EXCLUSIVE=$h_excl HEADER_EXTRA=$h_extra JW_EXEC=$h_exec WALLTIME_RAW=$WALLTIME MEM_RAW=$MEM WALLTIME=$w MEM=$m
   jw_fill_template "$sd/sub.template" "$dir/sub" \
-      SIMNAME RUN SBATCH_PARTITION SBATCH_ACCOUNT SBATCH_QOS SBATCH_MEM PARTITION WALLTIME NODES TASKS_PER_NODE CPUS_PER_TASK \
-      MAIL SLURM_MAIL_TYPE SBATCH_EXTRA || return 1
+      SIMNAME RUN SIMDIR RUNDIR EXE PARFILE PARTITION NODES TASKS_PER_NODE CPUS_PER_TASK CPUS_PER_NODE NTASKS NSLOTS \
+      MAIL MAIL_TYPE ACCOUNT QOS WALLTIME WALLTIME_RAW MEM MEM_RAW \
+      HEADER_PARTITION HEADER_ACCOUNT HEADER_QOS HEADER_MEM HEADER_MAIL HEADER_EXCLUSIVE HEADER_EXTRA JW_EXEC || return 1
   jw_fill_template "$sd/parfile.template" "$dir/$PARFILE" \
       CHECKPOINT_DIR MAX_RUNTIME WALLTIME_HOURS RUNTIME_MARGIN_MIN SIMDIR SIMNAME RUN DATADIRNAME || return 1
   ln "$sd/$EXE" "$dir/$EXE" 2>/dev/null || cp "$sd/$EXE" "$dir/$EXE" || return 1
@@ -339,27 +348,26 @@ jw_remove_unrun_run() {
 }
 jw_clear_prepared() { jw_remove_unrun_run "$1"; }
 
-# jw_submit_run <N> [prevjobid]: sbatch Run<N>/sub, afterok on prevjobid when that job is still queued/running.
-# Prints the new job id.
+# jw_submit_run <N> [prevjobid]: submit Run<N>/sub, to start after prevjobid succeeded when that
+# job is still queued or running. Prints the new job id.
 jw_submit_run() {
-  local n=$1 prev=${2:-} dir="$SIMDIR/Run$1" dep=() job
+  local n=$1 prev=${2:-} dir="$SIMDIR/Run$1" dep="" job
   if [ -n "$prev" ]; then
     jw_job_in_queue "$prev"
     case $? in
-      0) dep=(--dependency=afterok:"$prev" --kill-on-invalid-dep=yes) ;;
+      0) dep=$prev ;;
       1) jw_info "job $prev is no longer in the queue; submitting Run$n without a dependency" ;;
       *) jw_warn "cannot query job $prev; not submitting Run$n"; return 1 ;;
     esac
   fi
-  job=$( cd "$dir" && jw_sbatch "${dep[@]}" sub ) || return 1
+  job=$( cd "$dir" && jw_sched_submit sub "$dep" ) || return 1
   echo "$job" > "$dir/.jobid"
-  jw_status_set "$dir/status" state=QUEUED jobid="$job" submitted="$(date +%s)" depends="${dep[0]:+$prev}" predecessor="${prev:-none}"
-  [ ${#dep[@]} -eq 0 ] && jw_status_set "$dir/status" depends=none
-  jw_log "Run$n" "$job" QUEUED "${dep[0]:-no-dependency}"
+  jw_status_set "$dir/status" state=QUEUED jobid="$job" submitted="$(date +%s)" depends="${dep:-none}" predecessor="${prev:-none}"
+  jw_log "Run$n" "$job" QUEUED "$([ -n "$dep" ] && echo "after=$dep" || echo no-dependency)"
   echo "$job"
 }
 
-# jw_ensure_successors <N> <jobid-of-N>: keep QUEUE_DEPTH successors of Run<N> queued, chained by afterok.
+# jw_ensure_successors <N> <jobid-of-N>: keep QUEUE_DEPTH successors of Run<N> queued, each depending on the previous one.
 jw_ensure_successors() {
   local n=$1 prevjob=$2 d m dir st job
   for (( d=1; d<=QUEUE_DEPTH; d++ )); do
@@ -373,7 +381,7 @@ jw_ensure_successors() {
           jw_job_in_queue "$job"
           case $? in
             0) prevjob=$job; continue ;;
-            1) jw_warn "Run$m claims job $job but Slurm no longer runs it; moving the directory aside"
+            1) jw_warn "Run$m claims job $job but the scheduler no longer runs it; moving the directory aside"
                mv "$dir" "$dir.stale.$(date +%s)" || return 1 ;;
             *) jw_warn "cannot determine the state of job $job for Run$m; leaving the chain as is"; return 1 ;;
           esac ;;

@@ -1,33 +1,36 @@
 #!/bin/bash
-# jw_job.sh - runs inside the Slurm batch job, in a RunN directory.
+# jw_job.sh - runs inside the batch job, in a RunN directory (the batch script cd's there first).
 #
 # Sequence:
 #   1. record start, refuse to run if STOP is present
 #   2. verify the predecessor finished with state SUCCESS and that its termination checkpoint exists
-#   3. queue QUEUE_DEPTH successors (afterok on this job, killed by Slurm if this job fails)
+#   3. queue QUEUE_DEPTH successors (each depending on this job's success; the scheduler removes
+#      them if this job fails)
 #   4. launch Cactus; its output goes to cactus_<jobid>.out
 #   5. classify the outcome: SUCCESS / COMPLETE / FAILED, update status files, cancel successors when the chain ends
 #   6. run POST_RUN_HOOK (archiving, data merging)
-# Exit status 0 only for SUCCESS, COMPLETE or STOPPED; anything else is non-zero so afterok dependents never start.
+# Exit status 0 only for SUCCESS, COMPLETE or STOPPED; anything else is non-zero so that dependents never start.
+# Everything scheduler-specific comes from the frozen backend .sim_data/jw_sched.sh (jw_sched_*).
 
 set -uo pipefail
 
-RUNDIR=$(cd "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P) || exit 1
-cd "$RUNDIR" || exit 1
+RUNDIR=$(pwd -P) || exit 1
 SIMDIR=$(cd .. && pwd -P)
 . "$SIMDIR/.sim_data/jw_common.sh"
 jw_load_sim "$SIMDIR" || { echo "jw_job: cannot load $SIMDIR/.sim_data/config" >&2; exit 1; }
+jw_sched_job_env || { export JW_IN_JOB=no JW_JOBID=nojob JW_JOBID_SHORT=nojob JW_NODELIST="" JW_QUEUE=""; }
 
 RUN=$(jw_run_index "$RUNDIR")
-JOBID=${SLURM_JOB_ID:-nojob}
+JOBID=$JW_JOBID                 # as the scheduler names it: status files, chain.log, dependencies
+JOBTAG=$JW_JOBID_SHORT          # for file names
 STATUS=$RUNDIR/status
-CACTUS_OUT=cactus_${JOBID}.out
+CACTUS_OUT=cactus_${JOBTAG}.out
 T_START=$(date +%s)
 
 echo "$JOBID" > .jobid
-jw_status_set "$STATUS" state=RUNNING jobid="$JOBID" start="$T_START" nodes="${SLURM_JOB_NODELIST:-}" jw_version="$JW_VERSION"
-jw_log "Run$RUN" "$JOBID" START "nodes=${SLURM_JOB_NODELIST:-?} partition=${SLURM_JOB_PARTITION:-?}"
-echo "JobWatcher $JW_VERSION  sim=$SIMNAME run=$RUN job=$JOBID nodes=${SLURM_JOB_NODELIST:-?} $(date)"
+jw_status_set "$STATUS" state=RUNNING jobid="$JOBID" start="$T_START" nodes="$JW_NODELIST" jw_version="$JW_VERSION"
+jw_log "Run$RUN" "$JOBID" START "nodes=${JW_NODELIST:-?} queue=${JW_QUEUE:-?}"
+echo "JobWatcher $JW_VERSION  sim=$SIMNAME run=$RUN job=$JOBID nodes=${JW_NODELIST:-?} $(date)"
 
 mail_body() {               # <headline>
   cat <<EOT
@@ -36,7 +39,7 @@ $1
 Simulation : $SIMNAME
 Run        : Run$RUN   (job $JOBID)
 Directory  : $RUNDIR
-Nodes      : ${SLURM_JOB_NODELIST:-?}
+Nodes      : ${JW_NODELIST:-?}
 Iteration  : ${ITER:-?}   (previous ${LAST:-?})
 Sim time   : ${STIME:-?}
 Elapsed    : $(( $(date +%s) - T_START )) s
@@ -100,23 +103,20 @@ else
 fi
 
 # ---------------------------------------------------------------- 4. launch
-# Jobs are submitted with --export=$SBATCH_EXPORT (NONE by default: Slurm then gives the job a
-# fresh login environment instead of a copy of the submitter's, so every run sees the same
-# environment whether it was submitted from the login node or from its predecessor's job).
-# ENV_INIT (cluster config) runs first, e.g. to define `module`; then SETUP_SCRIPT; then EXTRA_ENV.
+# The backend submits jobs so that they get a fresh login environment instead of a copy of the
+# submitter's: every run sees the same environment whether it was submitted from the login node
+# or from its predecessor's job. ENV_INIT (cluster config) runs first, e.g. to define `module`;
+# then SETUP_SCRIPT; then EXTRA_ENV; then whatever the launcher needs to pass it on to the tasks.
 [ -n "$ENV_INIT" ] && eval "$ENV_INIT"
 if [ -n "$SETUP_SCRIPT" ]; then
   # shellcheck disable=SC1090
-  source "$SETUP_SCRIPT" > "env_setup_${JOBID}.log" 2>&1 || jw_warn "sourcing $SETUP_SCRIPT returned non-zero (see env_setup_${JOBID}.log)"
+  source "$SETUP_SCRIPT" > "env_setup_${JOBTAG}.log" 2>&1 || jw_warn "sourcing $SETUP_SCRIPT returned non-zero (see env_setup_${JOBTAG}.log)"
 fi
 export OMP_NUM_THREADS=$CPUS_PER_TASK OMP_PROC_BIND OMP_PLACES
 [ -n "$EXTRA_ENV" ] && eval "$EXTRA_ENV"
-# sbatch --export=NONE leaves SLURM_EXPORT_ENV=NONE in the job, and srun would then start the
-# Cactus tasks with an empty environment (no HOME, no PATH: MPI startup fails). The tasks must
-# get the environment built above, so tell srun to export everything.
-export SLURM_EXPORT_ENV=ALL
-env | sort > "env_${JOBID}.txt"
-echo "environment: $(wc -l < "env_${JOBID}.txt") variables, module=$(type -t module 2>/dev/null || echo undefined), SPACK_ENV=${SPACK_ENV:-unset}, unresolved shared libraries of ./$EXE: $(ldd "./$EXE" 2>/dev/null | grep -c 'not found') (env_${JOBID}.txt, env_setup_${JOBID}.log)"
+jw_sched_launcher_env
+env | sort > "env_${JOBTAG}.txt"
+echo "environment: $(wc -l < "env_${JOBTAG}.txt") variables, module=$(type -t module 2>/dev/null || echo undefined), SPACK_ENV=${SPACK_ENV:-unset}, unresolved shared libraries of ./$EXE: $(ldd "./$EXE" 2>/dev/null | grep -c 'not found') (env_${JOBTAG}.txt, env_setup_${JOBTAG}.log)"
 { mail_body "JobWatcher: $SIMNAME Run$RUN started" ; } | jw_mail start "[jw] $SIMNAME Run$RUN started"
 
 echo "launch: $LAUNCHER ./$EXE $PARFILE  (OMP_NUM_THREADS=$OMP_NUM_THREADS) at $(date)"
@@ -130,8 +130,9 @@ ITER=""; STIME=""
 if TERM_INFO=$(jw_term_checkpoint "$CACTUS_OUT"); then ITER=${TERM_INFO%% *}; STIME=${TERM_INFO#* }; [ "$STIME" = "$TERM_INFO" ] && STIME=""; fi
 
 if [ -z "$ITER" ]; then
-  if grep -q 'DUE TO TIME LIMIT' "$CACTUS_OUT" 2>/dev/null; then
-    fail "killed by Slurm time limit before writing a termination checkpoint (launcher rc=$RC); lower cactus::max_runtime or raise RUNTIME_MARGIN_MIN"
+  TL_RE=$(jw_sched_timelimit_regex)
+  if [ -n "$TL_RE" ] && grep -qE "$TL_RE" "$CACTUS_OUT" 2>/dev/null; then
+    fail "killed by the scheduler's time limit before writing a termination checkpoint (launcher rc=$RC); lower cactus::max_runtime or raise RUNTIME_MARGIN_MIN"
   fi
   fail "no termination checkpoint announced in $CACTUS_OUT (driver $DRIVER, launcher rc=$RC): crash, kill, or IO::checkpoint_on_terminate is not yes"
 fi
@@ -173,10 +174,10 @@ echo "$ITER $STIME Run$RUN $JOBID $(date +%s)" >> "$SIMDIR/.sim_data/last.histor
 if [ -n "$POST_RUN_HOOK" ]; then
   if [ -x "$POST_RUN_HOOK" ]; then
     echo "hook: $POST_RUN_HOOK $RUNDIR $finish_state"
-    if ! "$POST_RUN_HOOK" "$RUNDIR" "$finish_state" > "hook_${JOBID}.out" 2>&1; then
-      jw_log "Run$RUN" "$JOBID" HOOK-FAIL "$POST_RUN_HOOK (see hook_${JOBID}.out)"
+    if ! "$POST_RUN_HOOK" "$RUNDIR" "$finish_state" > "hook_${JOBTAG}.out" 2>&1; then
+      jw_log "Run$RUN" "$JOBID" HOOK-FAIL "$POST_RUN_HOOK (see hook_${JOBTAG}.out)"
       [ "$HOOK_FAILURE_FATAL" = yes ] && fail "POST_RUN_HOOK failed (run itself was $finish_state at iteration $ITER)"
-      jw_warn "POST_RUN_HOOK failed; see $RUNDIR/hook_${JOBID}.out"
+      jw_warn "POST_RUN_HOOK failed; see $RUNDIR/hook_${JOBTAG}.out"
     fi
   else
     jw_warn "POST_RUN_HOOK=$POST_RUN_HOOK is not executable; skipped"

@@ -54,7 +54,9 @@ printf 'IO::out_dir = "data#1" # trailing comment\nIO::recover = autoprobe # c\n
 check "par_get keeps # inside quotes, strips comments" '[ "$(jw_par_get "$T/par0" IO::out_dir)" = "data#1" ] && [ "$(jw_par_get "$T/par0" IO::recover)" = autoprobe ]'
 check "walltime rejects garbage"     '! jw_walltime_minutes "two days" 2>/dev/null'
 printf '$itlast = 64 * 16\n$final_time = 1000\nCactus::cctk_itlast = $itlast\nCactus::cctk_final_time = $final_time\n' > "$T/par1"
-check "job exports the environment to srun tasks despite --export=NONE" 'grep -q "^export SLURM_EXPORT_ENV=ALL" "$JW_HOME/lib/jw_job.sh"'
+check "the Slurm backend exports the environment to srun tasks despite --export=NONE" 'grep -q "export SLURM_EXPORT_ENV=ALL" "$JW_HOME/lib/sched/slurm.sh"'
+check "a backend missing a contract function is refused at load" \
+  'mkdir -p "$T/badsched/lib/sched" "$T/badsched/clusters" && printf "JW_SCHED_NAME=bad\n" > "$T/badsched/lib/sched/bad.sh" && ( JW_HOME=$T/badsched SCHEDULER=bad; . "$JW_HOME/lib/jw_common.sh"; jw_load_sched > "$T/badsched.log" 2>&1 ); grep -q "does not define jw_sched_defaults" "$T/badsched.log"'
 check "par_value resolves parfile variables" '[ "$(jw_num "$(jw_par_value "$T/par1" cactus::cctk_itlast)")" = 1024 ] && [ "$(jw_num "$(jw_par_value "$T/par1" cactus::cctk_final_time)")" = 1000 ]'
 
 echo "== configure: the user config file (setup script and personal defaults)"
@@ -86,7 +88,7 @@ mkdir -p "$T/acct"; mkpar "$T/acct/p.par" 100
 check "ACCOUNT and QOS render as #SBATCH lines, and are absent when unset" \
   '( cd "$T/acct" && "$JW" setup --yes --name ac --parfile p.par --exe "$JW_HOME/tests/fakecactus" --account abc123 --qos high > setup.log 2>&1 && "$JW" start > start.log 2>&1 ) && grep -q "^#SBATCH --account=abc123$" "$T/acct/Run1/sub" && grep -q "^#SBATCH --qos=high$" "$T/acct/Run1/sub" && ! grep -q -- "--account\|--qos" "$T/nopart/Run1/sub"'
 mkdir -p "$T/clusters" "$T/ovsim"; cp "$JW_HOME/tests/cluster.conf" "$T/clusters/ov.conf"; mkpar "$T/ovsim/p.par" 100
-{ cat "$JW_HOME/templates/slurm/sub.template"; } | sed "s|^@REP{SBATCH_EXTRA}|#SBATCH --comment=cluster-override\n@REP{SBATCH_EXTRA}|" > "$T/clusters/ov.sub.template"
+{ cat "$JW_HOME/templates/slurm/sub.template"; } | sed "s|^@REP{HEADER_EXTRA}|#SBATCH --comment=cluster-override\n@REP{HEADER_EXTRA}|" > "$T/clusters/ov.sub.template"
 check "clusters/<cluster>.sub.template overrides templates/slurm/sub.template" \
   '( cd "$T/ovsim" && JW_CLUSTER=$T/clusters/ov.conf "$JW" setup --yes --name ov --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 && JW_CLUSTER=$T/clusters/ov.conf "$JW" start > start.log 2>&1 ) && grep -q "^#SBATCH --comment=cluster-override$" "$T/ovsim/Run1/sub" && grep -q "^#SBATCH --time=1:00:00$" "$T/ovsim/Run1/sub"'
 mkdir -p "$T/cfgsim"; mkpar "$T/cfgsim/p.par" 100
@@ -105,7 +107,8 @@ check "parfile adapted: terminate any"   'grep -qi "cactus::terminate = \"any\""
 check "parfile adapted: final_time sentinel so 'any' does not stop at t=0" 'grep -q "cactus::cctk_final_time = 1e30" "$A/.sim_data/parfile.template"'
 check "parfile adapted: checkpoint yes"  'grep -q "CarpetIOHDF5::checkpoint = \"yes\"" "$A/.sim_data/parfile.template"'
 ( cd "$A" && "$JW" start > start.log 2>&1 ) || { fail "start A"; cat "$A/start.log"; }
-check "Run1 queued, Run2 queued with dependency" '[ "$(state "$A/Run1")" = QUEUED ] && [ "$(state "$A/Run2")" = QUEUED ] && grep -q afterok "$A/chain.log"'
+check "Run1 queued, Run2 queued with dependency" '[ "$(state "$A/Run1")" = QUEUED ] && [ "$(state "$A/Run2")" = QUEUED ] && grep -q "QUEUED *after=" "$A/chain.log" && grep -q "^depends=$(cat "$A/Run1/.jobid")$" "$A/Run2/status"'
+check "setup froze the scheduler backend and a trailer that cd's into the run directory" '[ -f "$A/.sim_data/jw_sched.sh" ] && grep -q "^cd .*SLURM_SUBMIT_DIR.* && exec bash ../.sim_data/jw_job.sh" "$A/Run1/sub" && grep -q "^#SBATCH --mail-type=FAIL$" "$A/Run1/sub"'
 check "filled parfile has max_runtime 55" 'grep -q "cactus::max_runtime = 55" "$A/Run1/bbh.par"'
 check "sub has --mem=4G"   'grep -q "^#SBATCH --mem=4G$" "$A/Run1/sub"'
 runqueue > "$A/queue.log" 2>&1
