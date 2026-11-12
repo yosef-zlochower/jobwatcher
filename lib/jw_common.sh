@@ -14,7 +14,8 @@ jw_info() { echo "jw: $*" >&2; }
 jw_apply_defaults() {
   : "${MASTERNODE:=}"
   : "${PARTITION:=}" "${WALLTIME:=24:00:00}" "${NODES:=1}"
-  : "${TASKS_PER_NODE:=1}" "${CPUS_PER_TASK:=1}" "${MEM:=}"
+  : "${TASKS_PER_NODE:=1}" "${CPUS_PER_TASK:=1}" "${MEM:=}" "${ACCOUNT:=}" "${QOS:=}"
+  : "${SCHEDULER:=slurm}"
   : "${CORES_PER_NODE:=$(( TASKS_PER_NODE * CPUS_PER_TASK ))}"
   : "${SETUP_SCRIPT:=}" "${LAUNCHER:=srun}"
   : "${OMP_PROC_BIND:=close}" "${OMP_PLACES:=cores}" "${EXTRA_ENV:=}" "${SBATCH_EXTRA:=}"
@@ -306,11 +307,15 @@ jw_prepare_run() {
   MAX_RUNTIME=$(( WALLTIME_MIN - RUNTIME_MARGIN_MIN ))
   (( MAX_RUNTIME > 0 )) || { jw_warn "WALLTIME $WALLTIME minus RUNTIME_MARGIN_MIN $RUNTIME_MARGIN_MIN is not positive"; return 1; }
   WALLTIME_HOURS=$(awk -v m="$WALLTIME_MIN" 'BEGIN{printf "%g", m / 60}')   # for TerminationTrigger::max_walltime
-  local SBATCH_MEM="" SBATCH_PARTITION=""
-  [ -n "$MEM" ] && SBATCH_MEM="#SBATCH --mem=$MEM"
+  # optional header lines: rendered only when the value is set
+  local SBATCH_MEM="" SBATCH_PARTITION="" SBATCH_ACCOUNT="" SBATCH_QOS=""
+  [ -n "$MEM" ]       && SBATCH_MEM="#SBATCH --mem=$MEM"
   [ -n "$PARTITION" ] && SBATCH_PARTITION="#SBATCH --partition=$PARTITION"
+  [ -n "$ACCOUNT" ]   && SBATCH_ACCOUNT="#SBATCH --account=$ACCOUNT"
+  [ -n "$QOS" ]       && SBATCH_QOS="#SBATCH --qos=$QOS"
   jw_fill_template "$sd/sub.template" "$dir/sub" \
-      SIMNAME RUN SBATCH_PARTITION PARTITION WALLTIME NODES TASKS_PER_NODE CPUS_PER_TASK SBATCH_MEM MAIL SLURM_MAIL_TYPE SBATCH_EXTRA || return 1
+      SIMNAME RUN SBATCH_PARTITION SBATCH_ACCOUNT SBATCH_QOS SBATCH_MEM PARTITION WALLTIME NODES TASKS_PER_NODE CPUS_PER_TASK \
+      MAIL SLURM_MAIL_TYPE SBATCH_EXTRA || return 1
   jw_fill_template "$sd/parfile.template" "$dir/$PARFILE" \
       CHECKPOINT_DIR MAX_RUNTIME WALLTIME_HOURS RUNTIME_MARGIN_MIN SIMDIR SIMNAME RUN DATADIRNAME || return 1
   ln "$sd/$EXE" "$dir/$EXE" 2>/dev/null || cp "$sd/$EXE" "$dir/$EXE" || return 1

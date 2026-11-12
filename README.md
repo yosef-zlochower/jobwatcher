@@ -49,6 +49,14 @@ Cluster-wide defaults (partitions, cores per node, launcher, `ENV_INIT`, ...) li
 there and is the model for adding another cluster; `JW_CLUSTER=<name>` (or a path to a file)
 selects one explicitly.
 
+The batch-script header is rendered from `templates/slurm/sub.template`, or from
+`clusters/<cluster>.sub.template` when a cluster ships its own. The placeholders
+`@REP{SBATCH_PARTITION}`, `@REP{SBATCH_ACCOUNT}`, `@REP{SBATCH_QOS}` and `@REP{SBATCH_MEM}` become
+`#SBATCH` lines when `PARTITION`, `ACCOUNT`, `QOS` or `MEM` is set and disappear otherwise
+(`jw configure --account A --qos Q`, or `jw setup --account`). Anything else a site needs
+(`--gres`, `--constraint`, `--exclusive`, ...) goes verbatim into `SBATCH_EXTRA`, for example
+`SBATCH_EXTRA='#SBATCH --gres=gpu:4'` in the cluster or user config.
+
 Configuration precedence: `clusters/<cluster>.conf` < `~/.config/jobwatcher/config` (`jw configure`)
 < `jw setup` options < edits to `<simdir>/.sim_data/config`. Existing simulations are
 self-contained: changing the user config affects only simulations set up afterwards.
@@ -88,7 +96,7 @@ Placeholders may also be written into the parfile by hand: `@REP{CHECKPOINT_DIR}
 <simdir>/
   .sim_data/config            resolved settings; edit between runs, successors pick the changes up
   .sim_data/parfile.template  adapted parfile with placeholders
-  .sim_data/sub.template      batch script template (clusters' sbatch header)
+  .sim_data/sub.template      batch script template (copied from templates/<scheduler>/ or the cluster's override)
   .sim_data/jw_job.sh, jw_common.sh   frozen copy of the logic; `jw sync` refreshes it
   .sim_data/<exe>             copy of the executable (Run dirs hard-link it)
   .sim_data/last              iteration of the last successful termination checkpoint

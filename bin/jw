@@ -38,6 +38,14 @@ jw_cluster_conf() {
   echo "$files"
 }
 
+# sub_template_file: the batch-script template: clusters/<cluster>.sub.template next to the cluster
+# config if it exists, else templates/<SCHEDULER>/sub.template.
+sub_template_file() {
+  local conf ov; conf=$(jw_cluster_conf) || return 1
+  ov=${conf%.conf}.sub.template
+  if [ -r "$ov" ]; then echo "$ov"; else echo "$JW_HOME/templates/${SCHEDULER:-slurm}/sub.template"; fi
+}
+
 jw_load_install_config() {
   local f
   f=$(jw_cluster_conf) || exit 1
@@ -173,6 +181,8 @@ cmd_setup() {
       --tasks-per-node) TASKS_PER_NODE=$2; shift 2 ;;
       --cpus-per-task) CPUS_PER_TASK=$2; shift 2 ;;
       --mem) MEM=$2; shift 2 ;;
+      --account|-A) ACCOUNT=$2; shift 2 ;;
+      --qos) QOS=$2; shift 2 ;;
       --max-runs) MAX_RUNS=$2; shift 2 ;;
       --queue-depth) QUEUE_DEPTH=$2; shift 2 ;;
       --min-progress) MIN_PROGRESS=$2; shift 2 ;;
@@ -229,7 +239,9 @@ cmd_setup() {
   cp "$EXEPATH" "$sd/$EXE" || jw_die "cannot copy executable"
   cp "$PARTPL" "$sd/parfile.template" || jw_die "cannot copy parameter file"
   adapt_parfile "$sd/parfile.template"
-  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$JW_HOME/templates/sub.template" "$sd/"
+  local tpl; tpl=$(sub_template_file) || exit 1
+  [ -r "$tpl" ] || jw_die "batch template $tpl not found"
+  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$sd/" && cp "$tpl" "$sd/sub.template" || jw_die "cannot copy the library"
   echo 0 > "$sd/last"
   write_config "$sd/config" "$NAME"
   jw_log setup - CREATED "name=$NAME exe=$EXE parfile=$PARFILE nodes=$NODES walltime=$WALLTIME partition=$PARTITION"
@@ -258,8 +270,11 @@ CORES_PER_NODE=$CORES_PER_NODE
 TASKS_PER_NODE=$TASKS_PER_NODE
 CPUS_PER_TASK=$CPUS_PER_TASK
 MEM=$MEM
+ACCOUNT=$ACCOUNT
+QOS=$QOS
 SBATCH_EXTRA=$(printf %q "$SBATCH_EXTRA")
 SBATCH_EXPORT=$SBATCH_EXPORT
+SCHEDULER=$SCHEDULER
 
 ENV_INIT=$(printf %q "$ENV_INIT")
 SETUP_SCRIPT=$(printf %q "$SETUP_SCRIPT")
@@ -286,9 +301,10 @@ EOT
 usage_setup() {
   cat <<EOT
 jw setup [--name N] [--parfile FILE] [--exe FILE] [--driver carpet|carpetx] [--partition P] [--time W] [--nodes N]
-         [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE] [--max-runs M] [--queue-depth D]
-         [--min-progress I] [--margin MIN] [--hook SCRIPT] [--mail ADDR] [--mail-events LIST]
-         [--setup-script FILE] [--launcher CMD] [--strict-checkpoint] [--yes]
+         [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE] [--account A] [--qos Q]
+         [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
+         [--mail ADDR] [--mail-events LIST] [--setup-script FILE] [--launcher CMD]
+         [--strict-checkpoint] [--yes]
 Run it in the (empty) directory that will hold the simulation. Missing values are prompted
 for unless --yes is given, in which case the defaults from the cluster config and
 the user config (written by 'jw configure') are used.
@@ -343,6 +359,8 @@ cmd_configure() {
       --tasks-per-node) sets+=("TASKS_PER_NODE=$2"); shift 2 ;;
       --cpus-per-task) sets+=("CPUS_PER_TASK=$2"); shift 2 ;;
       --mem) sets+=("MEM=$2"); shift 2 ;;
+      --account|-A) sets+=("ACCOUNT=$2"); shift 2 ;;
+      --qos) sets+=("QOS=$2"); shift 2 ;;
       --max-runs) sets+=("MAX_RUNS=$2"); shift 2 ;;
       --queue-depth) sets+=("QUEUE_DEPTH=$2"); shift 2 ;;
       --min-progress) sets+=("MIN_PROGRESS=$2"); shift 2 ;;
@@ -374,6 +392,8 @@ cmd_configure() {
     sets+=("TASKS_PER_NODE=$(ask "MPI tasks per node" "$TASKS_PER_NODE")")
     sets+=("CPUS_PER_TASK=$(ask "OpenMP threads per task" "$CPUS_PER_TASK")")
     sets+=("MEM=$(ask "Memory per node (--mem, e.g. 16G; 'none' = Slurm default)" "${MEM:-none}")")
+    sets+=("ACCOUNT=$(ask "Account/allocation to charge ('none' if the cluster has none)" "${ACCOUNT:-none}")")
+    sets+=("QOS=$(ask "QOS ('none' if not used)" "${QOS:-none}")")
     sets+=("QUEUE_DEPTH=$(ask "Successors to keep queued" "$QUEUE_DEPTH")")
     sets+=("RUNTIME_MARGIN_MIN=$(ask "Minutes reserved at the end of each run for the termination checkpoint" "$RUNTIME_MARGIN_MIN")")
     sets+=("MAIL=$(ask "Mail address" "$MAIL")")
@@ -393,7 +413,7 @@ EOT
     grep -qx "$k" <<<"$known" || jw_warn "$k is not a key jw uses (see clusters/*.conf); storing it anyway"
     case $k in
       SETUP_SCRIPT) v=$(check_setup_script "$v") || exit 1 ;;
-      MEM|PARTITION) [ "$v" = none ] && v="" ;;
+      MEM|PARTITION|ACCOUNT|QOS) [ "$v" = none ] && v="" ;;
       POST_RUN_HOOK)
         [ "$v" = none ] && v=""
         if [ -n "$v" ]; then v=${v/#\~/$HOME}; [ -x "$v" ] || jw_die "POST_RUN_HOOK $v is not an executable file"; v=$(readlink -f "$v"); fi ;;
@@ -415,7 +435,7 @@ usage_configure() {
 jw configure                          interactive: asks for the setup script and the defaults jw setup offers
 jw configure --setup-script FILE      script sourced inside every job to set up modules/spack ('none' = no script)
 jw configure [--partition P] [--time W] [--nodes N] [--tasks-per-node T] [--cpus-per-task C] [--mem SIZE]
-             [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
+             [--account A] [--qos Q] [--max-runs M] [--queue-depth D] [--min-progress I] [--margin MIN] [--hook SCRIPT]
              [--mail ADDR] [--mail-events LIST] [--launcher CMD] [KEY=VALUE ...] [--unset KEY ...]
 jw configure --show                   print the file
 Writes $(user_config_file) (\$XDG_CONFIG_HOME/jobwatcher/config; \$JW_CONFIG overrides). Values there override
@@ -536,7 +556,8 @@ cmd_sync() {
   need_sim
   local par=no
   while [ $# -gt 0 ]; do case $1 in --parfile) par=yes; shift ;; *) jw_die "sync: unknown option $1 (only --parfile)" ;; esac; done
-  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$JW_HOME/templates/sub.template" "$SIMDIR/.sim_data/" || jw_die "copy failed"
+  local tpl; tpl=$(sub_template_file) || exit 1
+  cp "$JW_HOME/lib/jw_common.sh" "$JW_HOME/lib/jw_job.sh" "$SIMDIR/.sim_data/" && cp "$tpl" "$SIMDIR/.sim_data/sub.template" || jw_die "copy failed"
   jw_log sync - SYNC "library and template updated from $JW_HOME (jw $JW_VERSION)"
   echo "updated $SIMDIR/.sim_data from $JW_HOME; every job that starts from now on (including already-queued ones) runs the new jw_job.sh"
   if [ $par = yes ]; then

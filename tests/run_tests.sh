@@ -82,6 +82,13 @@ check "JW_CLUSTER: a name in clusters/, a path, or the single shipped file; a ba
 mkdir -p "$T/nopart"; mkpar "$T/nopart/p.par" 100
 check "empty PARTITION leaves the --partition line out of the batch script" \
   '( cd "$T/nopart" && "$JW" setup --yes --name np --parfile p.par --exe "$JW_HOME/tests/fakecactus" --partition "" > setup.log 2>&1 && "$JW" start > start.log 2>&1 ) && ! grep -q -- "--partition" "$T/nopart/Run1/sub" && grep -q -- "--time=1:00:00" "$T/nopart/Run1/sub"'
+mkdir -p "$T/acct"; mkpar "$T/acct/p.par" 100
+check "ACCOUNT and QOS render as #SBATCH lines, and are absent when unset" \
+  '( cd "$T/acct" && "$JW" setup --yes --name ac --parfile p.par --exe "$JW_HOME/tests/fakecactus" --account abc123 --qos high > setup.log 2>&1 && "$JW" start > start.log 2>&1 ) && grep -q "^#SBATCH --account=abc123$" "$T/acct/Run1/sub" && grep -q "^#SBATCH --qos=high$" "$T/acct/Run1/sub" && ! grep -q -- "--account\|--qos" "$T/nopart/Run1/sub"'
+mkdir -p "$T/clusters" "$T/ovsim"; cp "$JW_HOME/tests/cluster.conf" "$T/clusters/ov.conf"; mkpar "$T/ovsim/p.par" 100
+{ cat "$JW_HOME/templates/slurm/sub.template"; } | sed "s|^@REP{SBATCH_EXTRA}|#SBATCH --comment=cluster-override\n@REP{SBATCH_EXTRA}|" > "$T/clusters/ov.sub.template"
+check "clusters/<cluster>.sub.template overrides templates/slurm/sub.template" \
+  '( cd "$T/ovsim" && JW_CLUSTER=$T/clusters/ov.conf "$JW" setup --yes --name ov --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 && JW_CLUSTER=$T/clusters/ov.conf "$JW" start > start.log 2>&1 ) && grep -q "^#SBATCH --comment=cluster-override$" "$T/ovsim/Run1/sub" && grep -q "^#SBATCH --time=1:00:00$" "$T/ovsim/Run1/sub"'
 mkdir -p "$T/cfgsim"; mkpar "$T/cfgsim/p.par" 100
 check "jw setup --yes takes the configured setup script" \
   '( cd "$T/cfgsim" && JW_CONFIG=$UC "$JW" setup --yes --name cfg --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "^SETUP_SCRIPT=$T/setup.sh$" "$T/cfgsim/.sim_data/config"'
