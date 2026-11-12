@@ -1,5 +1,5 @@
 #!/bin/bash
-# jw_common.sh - shared functions for JobWatcher (Slurm edition).
+# jw_common.sh - shared functions for JobWatcher.
 # Sourced by bin/jw (on the login node) and by jw_job.sh (inside the batch job).
 # Requires bash >= 4.  Every function is prefixed jw_.
 

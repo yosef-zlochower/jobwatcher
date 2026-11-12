@@ -1,5 +1,5 @@
 #!/bin/bash
-# jw - JobWatcher command line (Slurm edition).
+# jw - JobWatcher command line.
 #
 #   jw configure [options]  write ~/.config/jobwatcher/config: environment setup script and personal defaults
 #   jw setup  [options]      create a simulation in the current directory
