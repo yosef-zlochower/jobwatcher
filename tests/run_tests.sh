@@ -73,14 +73,12 @@ check "--unset removes a key, --show prints the file" \
   'JW_CONFIG=$UC "$JW" configure --unset PARTITION > /dev/null 2>&1 && ! grep -q "^PARTITION=" "$UC" && JW_CONFIG=$UC "$JW" configure --show | grep -q "^SETUP_SCRIPT="'
 check "an unknown key is stored with a warning" \
   'JW_CONFIG=$UC "$JW" configure MYKEY=1 > "$T/cfg2.log" 2>&1 && grep -q "^MYKEY=\"1\"$" "$UC" && grep -q "not a key" "$T/cfg2.log"'
-H=$T/home; mkdir -p "$H/.JobWatcher"; printf 'PARTITION="oldloc"\n' > "$H/.JobWatcher/config"
+H=$T/home; mkdir -p "$H"
 check "default location is \$XDG_CONFIG_HOME/jobwatcher/config, else ~/.config/jobwatcher/config" \
   '[ "$(env -u JW_CONFIG HOME=$H XDG_CONFIG_HOME=$T/xdg "$JW" configure --show | head -1)" = "# $T/xdg/jobwatcher/config" ] && [ "$(env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" configure --show | head -1)" = "# $H/.config/jobwatcher/config" ]'
-mkdir -p "$T/oldsim"; mkpar "$T/oldsim/p.par" 100
-check "the pre-2026-11 ~/.JobWatcher/config is still read when the new file is absent" \
-  '( cd "$T/oldsim" && env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" setup --yes --name old --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "^PARTITION=oldloc$" "$T/oldsim/.sim_data/config" && grep -q "run .jw configure. once" "$T/oldsim/setup.log"'
-check "jw configure moves the old file to the new location and the old one is then ignored" \
-  'env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" configure NODES=3 > "$T/cfg3.log" 2>&1 && grep -q "^PARTITION=\"oldloc\"$" "$H/.config/jobwatcher/config" && grep -q "^NODES=\"3\"$" "$H/.config/jobwatcher/config" && printf "PARTITION=\"stale\"\n" > "$H/.JobWatcher/config" && env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" configure --show | grep -q "^PARTITION=\"oldloc\"$"'
+mkdir -p "$T/xdgsim"; mkpar "$T/xdgsim/p.par" 100
+check "jw configure creates ~/.config/jobwatcher/config and jw setup reads it" \
+  'env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" configure PARTITION=xdgloc > /dev/null 2>&1 && grep -q "^PARTITION=\"xdgloc\"$" "$H/.config/jobwatcher/config" && ( cd "$T/xdgsim" && env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" setup --yes --name xdg --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "^PARTITION=xdgloc$" "$T/xdgsim/.sim_data/config"'
 mkdir -p "$T/cfgsim"; mkpar "$T/cfgsim/p.par" 100
 check "jw setup --yes takes the configured setup script" \
   '( cd "$T/cfgsim" && JW_CONFIG=$UC "$JW" setup --yes --name cfg --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "^SETUP_SCRIPT=$T/setup.sh$" "$T/cfgsim/.sim_data/config"'

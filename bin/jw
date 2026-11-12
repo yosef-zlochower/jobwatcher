@@ -22,19 +22,14 @@ JW_BIN=$(readlink -f "${BASH_SOURCE[0]}")
 JW_HOME=$(cd "$(dirname "$JW_BIN")/.." && pwd -P)
 . "$JW_HOME/lib/jw_common.sh"
 
-user_config_file()     { echo "${JW_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jobwatcher/config}"; }
-old_user_config_file() { echo "$HOME/.JobWatcher/config"; }     # location before 2026-11; read if the new one is absent
+user_config_file() { echo "${JW_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jobwatcher/config}"; }
 
 jw_load_install_config() {
   local cluster=${JW_CLUSTER:-gp} f
   f="$JW_HOME/clusters/$cluster.conf"
   [ -r "$f" ] && . "$f"
   f=$(user_config_file)
-  if [ -r "$f" ]; then . "$f"
-  elif [ -z "${JW_CONFIG:-}" ] && [ -r "$(old_user_config_file)" ]; then
-    . "$(old_user_config_file)"
-    jw_info "reading $(old_user_config_file); run 'jw configure' once to move it to $f"
-  fi
+  [ -r "$f" ] && . "$f"
   jw_apply_defaults
 }
 
@@ -371,10 +366,6 @@ cmd_configure() {
   fi
   known=$(known_keys)
   mkdir -p "$(dirname "$f")" || jw_die "cannot create $(dirname "$f")"
-  if [ ! -f "$f" ] && [ -z "${JW_CONFIG:-}" ] && [ -r "$(old_user_config_file)" ]; then
-    cp "$(old_user_config_file)" "$f" || jw_die "cannot copy $(old_user_config_file) to $f"
-    echo "moved your settings from $(old_user_config_file) to $f (the old file is no longer read; delete it)"
-  fi
   [ -f "$f" ] || cat > "$f" <<EOT
 # JobWatcher user configuration (created $(date '+%Y-%m-%d') by jw configure).
 # bash sources it after clusters/<cluster>.conf: every value here overrides the cluster default
