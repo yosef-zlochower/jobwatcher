@@ -9,11 +9,9 @@ export FAKE_SLURM_DIR=$T/fakeslurm
 mkdir -p "$T/bin" "$FAKE_SLURM_DIR"
 for c in sbatch squeue scancel srun mail runqueue; do ln -sf "$JW_HOME/tests/fakeslurm" "$T/bin/$c"; done
 export PATH=$T/bin:$PATH
+export JW_CLUSTER=$JW_HOME/tests/cluster.conf
 export JW_CONFIG=$T/userconfig
 cat > "$JW_CONFIG" <<EOF
-SETUP_SCRIPT=""
-LAUNCHER="srun --mpi=pmix"
-MASTERNODE=""
 MAIL=tester
 MAIL_EVENTS=start,success,fail,complete,stopped
 RUNTIME_MARGIN_MIN=5
@@ -62,7 +60,7 @@ check "par_value resolves parfile variables" '[ "$(jw_num "$(jw_par_value "$T/pa
 echo "== configure: the user config file (setup script and personal defaults)"
 UC=$T/cfg/config; printf '#!/bin/bash\nexport FROM_SETUP_SCRIPT=1\n' > "$T/setup.sh"
 check "configure creates the file with the setup script and a default" \
-  'JW_CONFIG=$UC "$JW" configure --setup-script "$T/setup.sh" --partition gp-long > "$T/cfg1.log" 2>&1 && grep -q "^SETUP_SCRIPT=\"$T/setup.sh\"$" "$UC" && grep -q "^PARTITION=\"gp-long\"$" "$UC"'
+  'JW_CONFIG=$UC "$JW" configure --setup-script "$T/setup.sh" --partition long > "$T/cfg1.log" 2>&1 && grep -q "^SETUP_SCRIPT=\"$T/setup.sh\"$" "$UC" && grep -q "^PARTITION=\"long\"$" "$UC"'
 check "KEY=VALUE replaces the key in place (one line, last value wins)" \
   'JW_CONFIG=$UC "$JW" configure PARTITION=debug > /dev/null 2>&1 && [ "$(grep -c "^PARTITION=" "$UC")" = 1 ] && grep -q "^PARTITION=\"debug\"$" "$UC"'
 check "a missing setup script is refused and the file is left alone" \
@@ -79,6 +77,11 @@ check "default location is \$XDG_CONFIG_HOME/jobwatcher/config, else ~/.config/j
 mkdir -p "$T/xdgsim"; mkpar "$T/xdgsim/p.par" 100
 check "jw configure creates ~/.config/jobwatcher/config and jw setup reads it" \
   'env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" configure PARTITION=xdgloc > /dev/null 2>&1 && grep -q "^PARTITION=\"xdgloc\"$" "$H/.config/jobwatcher/config" && ( cd "$T/xdgsim" && env -u JW_CONFIG -u XDG_CONFIG_HOME HOME=$H "$JW" setup --yes --name xdg --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "^PARTITION=xdgloc$" "$T/xdgsim/.sim_data/config"'
+check "JW_CLUSTER: a name in clusters/, a path, or the single shipped file; a bad name is refused" \
+  'env JW_CLUSTER=$(basename -s .conf "$(ls "$JW_HOME"/clusters/*.conf | head -1)") "$JW" configure --show > /dev/null 2>&1 && env -u JW_CLUSTER "$JW" configure --show > /dev/null 2>&1 && ! env JW_CLUSTER=nonexistent JW_CONFIG=$T/cfgx "$JW" configure PARTITION=x > "$T/cfgx.log" 2>&1 && grep -q "not found" "$T/cfgx.log" && [ ! -e "$T/cfgx" ]'
+mkdir -p "$T/nopart"; mkpar "$T/nopart/p.par" 100
+check "empty PARTITION leaves the --partition line out of the batch script" \
+  '( cd "$T/nopart" && "$JW" setup --yes --name np --parfile p.par --exe "$JW_HOME/tests/fakecactus" --partition "" > setup.log 2>&1 && "$JW" start > start.log 2>&1 ) && ! grep -q -- "--partition" "$T/nopart/Run1/sub" && grep -q -- "--time=1:00:00" "$T/nopart/Run1/sub"'
 mkdir -p "$T/cfgsim"; mkpar "$T/cfgsim/p.par" 100
 check "jw setup --yes takes the configured setup script" \
   '( cd "$T/cfgsim" && JW_CONFIG=$UC "$JW" setup --yes --name cfg --parfile p.par --exe "$JW_HOME/tests/fakecactus" > setup.log 2>&1 ) && grep -q "^SETUP_SCRIPT=$T/setup.sh$" "$T/cfgsim/.sim_data/config"'

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=@REP{PARTITION}
+@REP{SBATCH_PARTITION}
 #SBATCH --time=@REP{WALLTIME}
 #SBATCH --nodes=@REP{NODES}
 #SBATCH --ntasks-per-node=@REP{TASKS_PER_NODE}

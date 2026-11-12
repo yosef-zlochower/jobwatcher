@@ -24,10 +24,25 @@ JW_HOME=$(cd "$(dirname "$JW_BIN")/.." && pwd -P)
 
 user_config_file() { echo "${JW_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jobwatcher/config}"; }
 
+# jw_cluster_conf: the cluster config file. $JW_CLUSTER names one (a name in clusters/, or a path);
+# without it the file shipped in clusters/ is used when there is exactly one.
+jw_cluster_conf() {
+  local c=${JW_CLUSTER:-} files
+  case $c in
+    */*) echo "$c"; return 0 ;;
+    ?*)  echo "$JW_HOME/clusters/$c.conf"; return 0 ;;
+  esac
+  files=$(ls "$JW_HOME"/clusters/*.conf 2>/dev/null)
+  [ -n "$files" ] || { jw_warn "no cluster config in $JW_HOME/clusters"; return 1; }
+  [ "$(wc -l <<<"$files")" = 1 ] || { jw_warn "several cluster configs in $JW_HOME/clusters ($(basename -a -s .conf $files | tr '\n' ' ')); set JW_CLUSTER to one of them"; return 1; }
+  echo "$files"
+}
+
 jw_load_install_config() {
-  local cluster=${JW_CLUSTER:-gp} f
-  f="$JW_HOME/clusters/$cluster.conf"
-  [ -r "$f" ] && . "$f"
+  local f
+  f=$(jw_cluster_conf) || exit 1
+  [ -r "$f" ] || jw_die "cluster config $f not found (JW_CLUSTER=${JW_CLUSTER:-unset})"
+  . "$f"
   f=$(user_config_file)
   [ -r "$f" ] && . "$f"
   jw_apply_defaults
@@ -185,7 +200,7 @@ cmd_setup() {
   SETUP_SCRIPT=$(ask "Environment setup script sourced inside the job ('none' = bare login environment)" "${SETUP_SCRIPT:-none}")
   SETUP_SCRIPT=$(check_setup_script "$SETUP_SCRIPT") || exit 1
   [ -n "$SETUP_SCRIPT" ] || jw_warn "no SETUP_SCRIPT: the job runs with the bare login environment (set one with 'jw configure --setup-script FILE')"
-  PARTITION=$(ask "Partition" "$PARTITION")
+  PARTITION=$(ask "Partition (empty = Slurm default)" "$PARTITION")
   WALLTIME=$(ask "Walltime per run ([D-]HH:MM:SS)" "$WALLTIME")
   NODES=$(ask "Nodes" "$NODES")
   TASKS_PER_NODE=$(ask "MPI tasks per node" "$TASKS_PER_NODE")
@@ -303,7 +318,7 @@ config_unset() {            # <file> <KEY>
   tmp=$(mktemp "$f.XXXXXX") || return 1
   grep -v "^$k=" "$f" > "$tmp"; mv -f "$tmp" "$f"
 }
-known_keys() { { grep -ohE '^[A-Z_][A-Z0-9_]*=' "$JW_HOME"/clusters/*.conf | tr -d =; echo DRIVER; } | sort -u; }
+known_keys() { { grep -ohE '^[A-Z_][A-Z0-9_]*=' "$JW_HOME"/clusters/*.conf "$(jw_cluster_conf)" 2>/dev/null | tr -d =; echo DRIVER; } | sort -u; }
 
 # check_setup_script <value> -> absolute path on stdout ("" for none/empty); exit 1 if unreadable
 check_setup_script() {
@@ -346,13 +361,14 @@ cmd_configure() {
     if [ -r "$f" ]; then cat "$f"; else echo "# (does not exist yet: run 'jw configure')"; fi
     return 0
   fi
+  jw_load_install_config
   if [ ${#sets[@]} -eq 0 ] && [ ${#unsets[@]} -eq 0 ]; then       # interactive: the initial setup
-    jw_load_install_config; ASSUME_YES=no
+    ASSUME_YES=no
     echo "JobWatcher user configuration -> $f"
     echo "Enter keeps the value in brackets (your current setting, else the cluster default);"
     echo "'none' clears a path. These become the defaults that 'jw setup' offers."
     sets+=("SETUP_SCRIPT=$(ask "Environment setup script sourced inside every job (modules/spack)" "${SETUP_SCRIPT:-none}")")
-    sets+=("PARTITION=$(ask "Partition" "$PARTITION")")
+    sets+=("PARTITION=$(ask "Partition ('none' = Slurm default)" "${PARTITION:-none}")")
     sets+=("WALLTIME=$(ask "Walltime per run ([D-]HH:MM:SS)" "$WALLTIME")")
     sets+=("NODES=$(ask "Nodes" "$NODES")")
     sets+=("TASKS_PER_NODE=$(ask "MPI tasks per node" "$TASKS_PER_NODE")")
@@ -377,7 +393,7 @@ EOT
     grep -qx "$k" <<<"$known" || jw_warn "$k is not a key jw uses (see clusters/*.conf); storing it anyway"
     case $k in
       SETUP_SCRIPT) v=$(check_setup_script "$v") || exit 1 ;;
-      MEM) [ "$v" = none ] && v="" ;;
+      MEM|PARTITION) [ "$v" = none ] && v="" ;;
       POST_RUN_HOOK)
         [ "$v" = none ] && v=""
         if [ -n "$v" ]; then v=${v/#\~/$HOME}; [ -x "$v" ] || jw_die "POST_RUN_HOOK $v is not an executable file"; v=$(readlink -f "$v"); fi ;;

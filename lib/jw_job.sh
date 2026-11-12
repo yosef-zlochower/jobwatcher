@@ -112,7 +112,7 @@ fi
 export OMP_NUM_THREADS=$CPUS_PER_TASK OMP_PROC_BIND OMP_PLACES
 [ -n "$EXTRA_ENV" ] && eval "$EXTRA_ENV"
 # sbatch --export=NONE leaves SLURM_EXPORT_ENV=NONE in the job, and srun would then start the
-# Cactus tasks with an empty environment (no HOME, no PATH: PMIx/MPI_Init fails). The tasks must
+# Cactus tasks with an empty environment (no HOME, no PATH: MPI startup fails). The tasks must
 # get the environment built above, so tell srun to export everything.
 export SLURM_EXPORT_ENV=ALL
 env | sort > "env_${JOBID}.txt"

@@ -13,9 +13,10 @@ jw_info() { echo "jw: $*" >&2; }
 # Applied after the config files so that an old config missing a key still works.
 jw_apply_defaults() {
   : "${MASTERNODE:=}"
-  : "${PARTITION:=gp-default}" "${WALLTIME:=24:00:00}" "${NODES:=1}"
-  : "${CORES_PER_NODE:=32}" "${TASKS_PER_NODE:=8}" "${CPUS_PER_TASK:=4}" "${MEM:=}"
-  : "${SETUP_SCRIPT:=}" "${LAUNCHER:=srun --mpi=pmix}"
+  : "${PARTITION:=}" "${WALLTIME:=24:00:00}" "${NODES:=1}"
+  : "${TASKS_PER_NODE:=1}" "${CPUS_PER_TASK:=1}" "${MEM:=}"
+  : "${CORES_PER_NODE:=$(( TASKS_PER_NODE * CPUS_PER_TASK ))}"
+  : "${SETUP_SCRIPT:=}" "${LAUNCHER:=srun}"
   : "${OMP_PROC_BIND:=close}" "${OMP_PLACES:=cores}" "${EXTRA_ENV:=}" "${SBATCH_EXTRA:=}"
   : "${MAIL:=$USER}" "${SLURM_MAIL_TYPE:=FAIL}" "${MAIL_EVENTS:=fail,complete}"
   : "${MAX_RUNS:=100}" "${QUEUE_DEPTH:=1}" "${MIN_PROGRESS:=100}"
@@ -305,10 +306,11 @@ jw_prepare_run() {
   MAX_RUNTIME=$(( WALLTIME_MIN - RUNTIME_MARGIN_MIN ))
   (( MAX_RUNTIME > 0 )) || { jw_warn "WALLTIME $WALLTIME minus RUNTIME_MARGIN_MIN $RUNTIME_MARGIN_MIN is not positive"; return 1; }
   WALLTIME_HOURS=$(awk -v m="$WALLTIME_MIN" 'BEGIN{printf "%g", m / 60}')   # for TerminationTrigger::max_walltime
-  local SBATCH_MEM=""
+  local SBATCH_MEM="" SBATCH_PARTITION=""
   [ -n "$MEM" ] && SBATCH_MEM="#SBATCH --mem=$MEM"
+  [ -n "$PARTITION" ] && SBATCH_PARTITION="#SBATCH --partition=$PARTITION"
   jw_fill_template "$sd/sub.template" "$dir/sub" \
-      SIMNAME RUN PARTITION WALLTIME NODES TASKS_PER_NODE CPUS_PER_TASK SBATCH_MEM MAIL SLURM_MAIL_TYPE SBATCH_EXTRA || return 1
+      SIMNAME RUN SBATCH_PARTITION PARTITION WALLTIME NODES TASKS_PER_NODE CPUS_PER_TASK SBATCH_MEM MAIL SLURM_MAIL_TYPE SBATCH_EXTRA || return 1
   jw_fill_template "$sd/parfile.template" "$dir/$PARFILE" \
       CHECKPOINT_DIR MAX_RUNTIME WALLTIME_HOURS RUNTIME_MARGIN_MIN SIMDIR SIMNAME RUN DATADIRNAME || return 1
   ln "$sd/$EXE" "$dir/$EXE" 2>/dev/null || cp "$sd/$EXE" "$dir/$EXE" || return 1

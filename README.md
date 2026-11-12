@@ -45,8 +45,9 @@ for new simulations, `jw setup --hook` sets it for one, and `POST_RUN_HOOK=/path
 a failing hook fail the run.
 
 Cluster-wide defaults (partitions, cores per node, launcher, `ENV_INIT`, ...) live in
-`clusters/<cluster>.conf`; `$JW_CLUSTER` selects the file, and the one shipped in `clusters/` is
-the model for adding another cluster.
+`clusters/<cluster>.conf`. The file shipped in `clusters/` is used as long as it is the only one
+there and is the model for adding another cluster; `JW_CLUSTER=<name>` (or a path to a file)
+selects one explicitly.
 
 Configuration precedence: `clusters/<cluster>.conf` < `~/.config/jobwatcher/config` (`jw configure`)
 < `jw setup` options < edits to `<simdir>/.sim_data/config`. Existing simulations are
